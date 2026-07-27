@@ -1,6 +1,6 @@
-# uaip — an edge-native LLM gateway
+# edge-llm-gateway — a full-stack LLM gateway on one Cloudflare Worker
 
-[![CI](https://github.com/Jhongwe1/uaip/actions/workflows/ci.yml/badge.svg)](https://github.com/Jhongwe1/uaip/actions/workflows/ci.yml)
+[![CI](https://github.com/Jhongwe1/edge-llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Jhongwe1/edge-llm-gateway/actions/workflows/ci.yml)
 [![Try the live demo — no login needed](https://img.shields.io/badge/live%20demo-try%20it%20without%20signing%20in-2ea44f)](https://uaip.cc.cd/playground)
 &nbsp;Live: **<https://uaip.cc.cd>** · 繁體中文版說明：**[README.zh-TW.md](./README.zh-TW.md)**
 
@@ -75,7 +75,7 @@ site, which is the point of running one Worker instead of four:
 | **Playground** | `/playground` | ChatGPT-style web chat over the same channels (v2.2 shell); conversations in D1; SSE with provider-identity sanitization. Anonymous **demo mode** is fail-closed — the deliberate inverse of the member path's fail-open quotas ([ADR-0009](./docs/adr/0009-demo-mode-fail-closed.md)). A **hidden-model lock** can pin every member to one admin-chosen model — enforced server-side, and the API masks which model it is. |
 | **Content portal** | `/news` `/articles` `/p/{slug}` | SSR CMS with D1-stored images, RSS, sitemap, OG/JSON-LD, custom pages. |
 | **VPN subscription** | `/vpn` | Multi-upstream merge behind one member URL; invisible to anyone without the grant unless the admin flips the public-visibility switch. |
-| **Tools** | `/ip` `/ua` | The original IP/UA lookup SPA (the site root now lands on the chat). |
+| **Tools** | `/ip` `/ua` | The original IP / User-Agent lookup SPA — edge-observed request data plus locally-computed browser fingerprints (canvas, WebGL, audio; demo hashes, not cryptographic). The site root now lands on the chat. |
 | **Admin** | `/settings` `/members` `/admin` `/logs` `/api-docs` | Everything the API can set, settable from the web: quotas, demo mode, hidden-model lock, VPN visibility, pricing, Telegram alerts, custom pages; member/service management; visitor + error + usage-with-cost dashboards. |
 
 Identity: Google OAuth → HttpOnly session (sids hashed in D1). Per-service grants

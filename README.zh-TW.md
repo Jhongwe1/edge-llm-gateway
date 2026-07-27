@@ -1,6 +1,6 @@
-# uaip — edge-native LLM 中轉站
+# edge-llm-gateway — 跑在單顆 Cloudflare Worker 上的 LLM 中轉站
 
-[![CI](https://github.com/Jhongwe1/uaip/actions/workflows/ci.yml/badge.svg)](https://github.com/Jhongwe1/uaip/actions/workflows/ci.yml)
+[![CI](https://github.com/Jhongwe1/edge-llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Jhongwe1/edge-llm-gateway/actions/workflows/ci.yml)
 [![線上 demo — 免登入直接試](https://img.shields.io/badge/live%20demo-%E5%85%8D%E7%99%BB%E5%85%A5%E7%9B%B4%E6%8E%A5%E8%A9%A6-2ea44f)](https://uaip.cc.cd/playground)
 &nbsp;線上：**<https://uaip.cc.cd>** · English: **[README.md](./README.md)**
 
@@ -66,7 +66,7 @@ v1 的作法是「COUNT 一下 req_log，沒超標就放行」—— 兩個併�
 | **Playground** | `/playground` | ChatGPT 風格網頁聊天（v2.2 外殼、同一批渠道）；對話存 D1；SSE 串流、上游身分淨化。匿名**體驗模式**是 fail-closed —— 與會員路徑 fail-open 的配額刻意相反（[ADR-0009](./docs/adr/0009-demo-mode-fail-closed.md)）。另有**單一隱藏模型鎖定**：把所有會員鎖在站長指定的一個模型 — 伺服器端強制，API 也遮掉那是哪個模型。 |
 | **內容門戶** | `/news` `/articles` `/p/{slug}` | SSR 新聞／文章系統：圖片存 D1、RSS、sitemap、OG/JSON-LD、自訂頁面。 |
 | **VPN 訂閱** | `/vpn` | 多上游合併成一條會員網址；沒有這項權限的人連它存在都看不到（站長可用開關改成對外展示）。 |
-| **工具** | `/ip` `/ua` | 最早的 IP／UA 查詢 SPA（根網址現在直接進聊天）。 |
+| **工具** | `/ip` `/ua` | 最早的 IP／UA 查詢 SPA — 邊緣觀測到的請求資訊，加上瀏覽器本機算出的指紋（canvas／WebGL／audio；示範用雜湊，非密碼學等級）。根網址現在直接進聊天。 |
 | **管理** | `/settings` `/members` `/admin` `/logs` `/api-docs` | API 能設的，網頁全能設：配額、體驗模式、隱藏模型鎖定、VPN 展示、定價、Telegram 告警、自訂頁面；會員／服務管理；訪客＋錯誤＋用量（含成本）儀表板。 |
 
 身分：Google OAuth → HttpOnly session（sid 只存雜湊）。每個會員可**分服務批准**

@@ -1,9 +1,9 @@
 {
-  "name": "uaip",
+  "name": "edge-llm-gateway",
   "version": "2.2.0",
   "private": true,
   "type": "module",
-  "description": "Edge-native LLM gateway + personal portal on Cloudflare Workers (zero framework, zero runtime deps, D1 only).",
+  "description": "Full-stack LLM gateway on a single Cloudflare Worker — atomic quotas, per-request cost metering, 10 ms-CPU-safe streaming, plus a ChatGPT-style playground, CMS, VPN subscriptions and an IP / User-Agent / browser-fingerprint tool. Zero framework, zero runtime deps, D1 only.",
   "scripts": {
     "dev": "wrangler dev --var DEV_UNSAFE_ADMIN:1",
     "test": "vitest run --reporter=default --reporter=json --outputFile=.vitest-report.json",

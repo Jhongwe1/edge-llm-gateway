@@ -17,7 +17,7 @@ info:
     * **匿名** — 公開讀取；Playground 體驗模式開啟時匿名可試聊（fail-closed 限流）
   license:
     name: MIT
-    url: https://github.com/Jhongwe1/uaip/blob/main/LICENSE
+    url: https://github.com/Jhongwe1/edge-llm-gateway/blob/main/LICENSE
 servers:
   - url: https://uaip.cc.cd
 tags:
