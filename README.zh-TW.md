@@ -12,12 +12,15 @@
 > 不用註冊就能跟真模型聊（fail-closed 限流；對話只留給站長看，訪客這邊沒有歷史紀錄）。
 
 <p align="center">
-  <img src="./docs/assets/playground-demo.png" alt="匿名體驗模式聊天（v2.2 UI）" width="49%">
-  <img src="./docs/assets/logs-usage-cost.png" alt="用量儀表板（含估算成本）" width="49%">
+  <img src="./docs/assets/mobile-playground-models.jpg" alt="Playground 聊天，頁首模型選單展開" width="24%">
+  <img src="./docs/assets/mobile-usage-cost.jpg" alt="用量儀表板：請求數、耗時分位、tokens 與估算成本" width="24%">
+  <img src="./docs/assets/mobile-sidebar.jpg" alt="側邊欄：聊天、API 中轉、VPN、工具與內容分區" width="24%">
+  <img src="./docs/assets/mobile-ip-ua.jpg" alt="IP／UA 查詢，含邊緣觀測到的連線資訊" width="24%">
 </p>
 
-<p align="center"><sub>v2.2 UI：全站 ChatGPT 風格外殼 — 常駐側邊欄（選單＋聊天紀錄）、
-頁首模型選單、預設深色、預設英文（可切中文）。</sub></p>
+<p align="center"><sub>v2.2 UI 手機版 — 模型選單 · 用量與成本儀表板 · 側邊欄 · IP／UA 查詢。
+全站共用一套 ChatGPT 風格外殼：常駐側邊欄（選單＋聊天紀錄）、頁首模型選單、預設深色、
+預設英文（可切中文）。</sub></p>
 
 ## 中轉站本體
 

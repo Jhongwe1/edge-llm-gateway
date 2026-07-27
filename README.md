@@ -15,12 +15,15 @@ supply chain.
 > rate limits; chats are logged for the site admin only — visitors get no history).
 
 <p align="center">
-  <img src="./docs/assets/playground-demo.png" alt="Anonymous demo mode chat (v2.2 UI)" width="49%">
-  <img src="./docs/assets/logs-usage-cost.png" alt="Usage dashboard with estimated cost" width="49%">
+  <img src="./docs/assets/mobile-playground-models.jpg" alt="Playground chat with the header model picker open" width="24%">
+  <img src="./docs/assets/mobile-usage-cost.jpg" alt="Usage dashboard: requests, latency percentiles, tokens and estimated cost" width="24%">
+  <img src="./docs/assets/mobile-sidebar.jpg" alt="Sidebar: chat, API relay, VPN, tools and content sections" width="24%">
+  <img src="./docs/assets/mobile-ip-ua.jpg" alt="IP / User-Agent lookup with edge-observed connection info" width="24%">
 </p>
 
-<p align="center"><sub>v2.2 UI: a ChatGPT-style shell across the whole site — persistent sidebar
-(menu + chat history), header model picker, dark-first, English-first with a 中文 toggle.</sub></p>
+<p align="center"><sub>v2.2 UI on mobile — model picker · usage &amp; cost dashboard · sidebar · IP/UA lookup.
+One ChatGPT-style shell across the whole site: persistent sidebar (menu + chat history), header model
+picker, dark-first, English-first with a 中文 toggle.</sub></p>
 
 ## The gateway
 
