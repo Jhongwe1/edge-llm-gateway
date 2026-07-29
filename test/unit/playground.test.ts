@@ -406,9 +406,27 @@ describe("cleanChat — files 欄位與控制字元", () => {
     expect(v.err).toBeUndefined();
     expect(v.messages![0].fileIds).toEqual([3, 7, 9]);
   });
-  it("超過單則上限就截斷", () => {
+  // 2026-07-29 站長打回票：舊行為是對每一則都靜默截斷，會員傳 8 張只送出 4 張、
+  // 畫面一聲不吭。現在「正在送的那一則」超量就報錯，只有歷史訊息還會截斷。
+  it("正在送的那一則超過上限 → 報錯，不截斷（不能在使用者不知情下少送）", () => {
     const many = Array.from({ length: PG_LIMITS.maxImgPerMsg + 3 }, (_, i) => i + 1);
     const v = cleanChat(base({ role: "user", content: "x", files: many }));
+    expect(v.err).toContain("最多 " + PG_LIMITS.maxImgPerMsg + " 張");
+    expect(v.err).toContain("你選了 " + many.length + " 張"); // 講得出他到底選了幾張
+  });
+
+  it("歷史訊息超量仍然截斷（既成事實，不能讓舊對話再也接不下去）", () => {
+    const many = Array.from({ length: PG_LIMITS.maxImgPerMsg + 3 }, (_, i) => i + 1);
+    const v = cleanChat({
+      channel: "c",
+      model: "m",
+      messages: [
+        { role: "user", content: "舊訊息", files: many },
+        { role: "assistant", content: "好" },
+        { role: "user", content: "新問題" }
+      ]
+    });
+    expect(v.err).toBeUndefined();
     expect(v.messages![0].fileIds!.length).toBe(PG_LIMITS.maxImgPerMsg);
   });
   it("只有圖片、沒有文字的訊息是合法的", () => {

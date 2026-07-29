@@ -197,8 +197,11 @@ export async function playgroundPageResponse(env: Env, request: Request): Promis
   const compressTo = Math.min(plan.maxKb * 1024, PG_LIMITS.maxImgBytesTotal);
 
   const body =
+    // total＝整趟請求所有圖片的 bytes 上限（PG_LIMITS.maxImgBytesTotal）。前端要知道它，
+    // 才有辦法在「加圖」與「送出」當下就講清楚 —— 以前這個預算只有伺服器知道，
+    // 超過的圖被默默降級成文字佔位，會員完全不知道自己少送了東西（2026-07-29 修）。
     "<script data-nonce>window.__PGFILE=" +
-    JSON.stringify({ max: compressTo, store: plan.store }) +
+    JSON.stringify({ max: compressTo, store: plan.store, total: PG_LIMITS.maxImgBytesTotal }) +
     ";</script>\n" +
     '<div id="root"><div class="gate"><div class="spin"></div></div></div>\n' +
     '<script data-nonce src="' +
@@ -650,6 +653,19 @@ const PG_JS = `
     for(var i=0;i<atts.length;i++)if(atts[i].kind==="image")n++;
     return n;
   }
+  /* 圖片的 bytes 總和，與伺服器的 maxImgBytesTotal 對照。
+     **張數不是真正的天花板，這個才是** —— 組上游 body 的 CPU 成本跟總 bytes 成正比，
+     跟幾張無關（10 張各 150KB 與 3 張各 500KB 對 CPU 一模一樣）。所以 10 張沒滿
+     也可能先撞到這條，必須讓使用者看得到，不能讓伺服器默默砍掉。 */
+  function imgBytes(){
+    var n=0;
+    for(var i=0;i<atts.length;i++)if(atts[i].kind==="image")n+=atts[i].bytes||0;
+    return n;
+  }
+  function bytesBudget(){
+    return (window.__PGFILE&&window.__PGFILE.total)||1500000;
+  }
+  function mb(n){return Math.round(n/100000)/10;}
 
   /* ＋ 按下去：直接開檔案選擇器，不插一層「上傳照片／上傳檔案」的選單 ——
      多一次點擊只為了選類別，而檔案選擇器本來就分得出來。
@@ -692,7 +708,9 @@ const PG_JS = `
     var maxBytes=(window.__PGFILE&&window.__PGFILE.max)||1400*1024;
     var canImg=seesImages(),lim=maxImgs();
     files.forEach(function(f){
-      if(atts.length>=8){MU.flash(tx("一次最多 8 個附件","Up to 8 attachments at a time"));return;}
+      /* 附件總數的上限（圖片＋文件）。要比「單則最多幾張圖」大，否則圖片還沒到
+         自己的上限就先被這條擋掉，訊息會變成前後矛盾（說最多 10 張、8 張就擋）。 */
+      if(atts.length>=12){MU.flash(tx("一次最多 12 個附件","Up to 12 attachments at a time"));return;}
       if(PGA.isImage(f)){
         /* 這個模型根本看不了圖。只擋圖片 —— 同一批裡的文件照收，它們會被轉成文字，
            跟 vision 無關。 */
@@ -720,6 +738,13 @@ const PG_JS = `
           return PGA.upload(img);
         }).then(function(d){
           ph.id=d.id;ph.busy=false;renderAtts();
+          /* 壓完才知道真實大小，所以容量檢查放在這裡（挑檔案當下只知道原始大小，
+             壓縮後可能差好幾倍）。超了就當場講，但**不自動移除** —— 該犧牲哪一張
+             是使用者的決定，不是我們的。 */
+          if(imgBytes()>bytesBudget()){
+            MU.flash(tx("這幾張圖加起來太大（上限約 "+mb(bytesBudget())+"MB）— 送出前請先移除幾張",
+                        "These images exceed the ~"+mb(bytesBudget())+"MB total limit — remove some before sending"));
+          }
         }).catch(function(e){
           dropAtt(ph);
           MU.flash(esc(e.message||e));
@@ -1005,6 +1030,13 @@ const PG_JS = `
               "This model reads only 1 image at a time — remove the extras or switch models")
           :tx("這個模型一次最多 "+lim3+" 張圖 — 請移除多餘的圖片",
               "This model takes at most "+lim3+" images — please remove the extras"));
+        return;
+      }
+      /* 容量：張數沒滿也可能先撞到這條（見 imgBytes 的註解）。
+         擋在這裡而不是讓伺服器降級 —— 伺服器現在也會回錯誤了，但那要多跑一趟。 */
+      if(imgBytes()>bytesBudget()){
+        MU.flash(tx("這幾張圖加起來太大（上限約 "+mb(bytesBudget())+"MB）— 請移除幾張再送",
+                    "These images exceed the ~"+mb(bytesBudget())+"MB total limit — remove some and try again"));
         return;
       }
     }

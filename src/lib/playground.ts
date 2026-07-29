@@ -19,7 +19,12 @@ export const PG_LIMITS = {
   maxTotal: 300000, // 整包訊息字數上限
   maxTokens: 4096, // anthropic 必填 max_tokens；取各型號都安全的值
   // ── 附件（v2.3）──
-  maxImgPerMsg: 4, // 單則訊息最多幾張圖
+  // 單則訊息最多幾張圖。4 → 10（2026-07-29 站長要求）。
+  // **這個數字不是效能限制**，別再拿它當 CPU 護欄 —— 真正被實測釘住的是下面的
+  // maxImgBytesTotal。組上游 body 的成本跟「總 bytes」成正比，跟「幾張」無關：
+  // 10 張各 150KB 與 3 張各 500KB 對 CPU 完全一樣。10 只是「一次對話裡塞得下的
+  // 合理張數」，真正會先撞到的天花板永遠是 bytes 那條。
+  maxImgPerMsg: 10,
   // 單次請求「所有圖片」的原始 bytes 總和上限。這個數字是量出來的，不是拍的：
   // 組上游 body 的成本（含 fetch 必付的 bytes 轉換，實測 2026-07-29）
   //   933KB base64 → 1.62ms ｜ 1.8MB → 3.31ms ｜ 2.8MB → 6.00ms
@@ -178,7 +183,13 @@ export function cleanChat(b: any): CleanChatResult {
       /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
       ""
     );
-    const fileIds = Array.isArray(m.files)
+    // 這一則帶的附件編號。**超過上限時是報錯，不是默默砍掉**（2026-07-29 站長打回票）：
+    // 舊版對每一則都 .slice(0, maxImgPerMsg)，會員傳 8 張只有 4 張進得去、
+    // 另外 4 張連綁都沒綁就變孤兒，而畫面上什麼都沒說 —— 他以為 8 張都送到了。
+    // 「使用者不知情的情況下少送東西」比「直接告訴他不行」糟糕得多。
+    // 只有**最後一則**（＝他正在送的這一句）報錯；更早的歷史訊息仍然截斷，
+    // 因為那些是既成事實，為了舊對話裡的一則就讓整串再也不能聊是本末倒置。
+    const rawIds = Array.isArray(m.files)
       ? m.files
           .map(function (x: unknown) {
             return parseInt(String(x), 10);
@@ -186,8 +197,14 @@ export function cleanChat(b: any): CleanChatResult {
           .filter(function (x: number) {
             return x > 0;
           })
-          .slice(0, PG_LIMITS.maxImgPerMsg)
       : [];
+    const isLast = i === b.messages.length - 1;
+    if (isLast && rawIds.length > PG_LIMITS.maxImgPerMsg) {
+      return {
+        err: "一次最多 " + PG_LIMITS.maxImgPerMsg + " 張圖片（你選了 " + rawIds.length + " 張）"
+      };
+    }
+    const fileIds = rawIds.slice(0, PG_LIMITS.maxImgPerMsg);
     // 純圖片、沒有文字的訊息是合法的（「這張圖是什麼？」有時就只丟一張圖）
     if (!content.trim() && !fileIds.length) continue;
     if (content.length > PG_LIMITS.maxChars) return { err: "有訊息超過單則字數上限" };
@@ -347,16 +364,50 @@ export async function loadImages(
     if (!m.fileIds || !m.fileIds.length) continue;
     const rows: FileRow[] = [];
     const dropped: string[] = [];
+    let overCount = false, // 這一則有圖是因為「張數」被擋掉的
+      overBytes = false; // 這一則有圖是因為「總容量」被擋掉的
     for (const id of m.fileIds) {
       const row = byId.get(id);
       const label = (row && row.name) || "圖片";
-      if (!row || row.purged || !seesImages || Number(row.bytes) > budget || slots <= 0) {
+      if (!row || row.purged || !seesImages) {
+        dropped.push(label);
+        continue;
+      }
+      if (slots <= 0) {
+        overCount = true;
+        dropped.push(label);
+        continue;
+      }
+      if (Number(row.bytes) > budget) {
+        overBytes = true;
         dropped.push(label);
         continue;
       }
       rows.push(row);
       budget -= Number(row.bytes) || 0;
       slots--;
+    }
+    // **正在送的這一則不准偷砍**（2026-07-29 站長打回票）：他明確挑了這幾張圖，
+    // 少送任何一張都必須當面說，不能只在內容裡塞一行佔位、讓他以為全都送到了。
+    // 歷史訊息仍然沿用靜默降級 —— 那些是既成事實，為了很久以前的一則圖
+    // 讓整串對話再也接不下去才是真的糟。
+    if (i === messages.length - 1) {
+      if (overCount) {
+        return {
+          err:
+            "這個模型一次最多看 " +
+            (maxImgs == null ? PG_LIMITS.maxImgPerMsg : maxImgs) +
+            " 張圖 — 請移除多餘的圖片，或換一個模型"
+        };
+      }
+      if (overBytes) {
+        return {
+          err:
+            "這幾張圖加起來太大（上限約 " +
+            Math.round(PG_LIMITS.maxImgBytesTotal / 100000) / 10 +
+            "MB）— 請減少張數或換小一點的圖"
+        };
+      }
     }
     if (rows.length) want.push({ m: m, rows: rows });
     if (dropped.length) {

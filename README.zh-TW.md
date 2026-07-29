@@ -122,7 +122,7 @@ flowchart LR
 
 ## 工程證據（v2.4.1）
 
-- **542 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
+- **545 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。
   上游用 fetchMock 攔截，斷言「上游實際收到什麼」（標頭剝除、金鑰置換、串流位元組保真、
   demo 模式強制 max_tokens）。

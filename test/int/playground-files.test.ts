@@ -300,7 +300,9 @@ describe("聊天串接", () => {
       );
   }
 
-  it("上游說這個模型只吃 1 張 → 只送 1 張出去，其餘降級成文字佔位（不是回錯誤）", async () => {
+  it("上游說只吃 1 張、使用者送 3 張 → 回錯誤講清楚，【絕不默默只送 1 張】", async () => {
+    // 2026-07-29 站長打回票的正是「偷砍」：他傳 8 張、系統只送 4 張且一聲不吭。
+    // 正在送的這一則少送任何一張都必須當面說。刻意不掛 interceptor —— 上游根本不該被呼叫。
     const u = await approved();
     const ch = await seedChannel({
       models: "m1",
@@ -309,8 +311,6 @@ describe("聊天串接", () => {
       model_caps: '{"m1":1}'
     });
     const ids = await upload3(u);
-    let sent = "";
-    interceptOnce((b) => (sent = b));
 
     const ctx = await chatCtx(u, {
       channel: ch.slug,
@@ -318,13 +318,54 @@ describe("聊天串接", () => {
       messages: [{ role: "user", content: "比較這幾張", files: ids }]
     });
     const r = await chat(ctx);
+    await drainWaits(ctx);
+    expect(r.status).toBe(400);
+    const j = (await r.json()) as any;
+    expect(j.error).toBe("no-vision"); // loadImages 的擋門共用這個代碼
+    expect(j.hint).toContain("最多看 1 張圖"); // 講得出具體數字
+  });
+
+  it("同一個 1 張上限的模型、只送 1 張 → 正常送出（擋的是超量，不是功能）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "m1",
+      base_url: UP,
+      model_caps: '{"m1":1}'
+    });
+    const up = await upCtx(u, fakeWebp(300));
+    const fid = ((await (await uploadFile(up)).json()) as any).id;
+    await drainWaits(up);
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "這是什麼", files: [fid] }]
+    });
+    const r = await chat(ctx);
     await readAll(r);
     await drainWaits(ctx);
-
-    // 真正送出去的就是 1 張 —— 多一張就是上游那發 400
+    expect(r.status).toBe(200);
     expect(sent.split("data:image/webp;base64,").length - 1).toBe(1);
-    // 被砍掉的有講出來，模型知道這裡本來還有圖（使用者從對話也看得到）
-    expect(sent).toContain("已省略的圖片");
+  });
+
+  it("超過站上硬上限（10 張）→ cleanChat 就擋，不會靜默截斷成 10 張", async () => {
+    const u = await approved();
+    const ch = await seedChannel({ models: "m1", vision_models: "m1", base_url: UP });
+    // 不必真的上傳 11 個檔 —— cleanChat 是純驗證，看的是編號數量
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "一堆圖", files: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] }]
+    });
+    const r = await chat(ctx);
+    await drainWaits(ctx);
+    expect(r.status).toBe(400);
+    const j = (await r.json()) as any;
+    expect(j.error).toBe("bad-input");
+    expect(j.hint).toContain("你選了 11 張"); // 明講他選了幾張、上限是多少
   });
 
   it("上游沒回報能力時照舊吃站上的預設張數（改動前的行為不變）", async () => {
@@ -404,19 +445,30 @@ describe("聊天串接", () => {
       .first<any>();
     expect(JSON.parse(row.model_caps)).toEqual({ adv: { m1: 10 }, seen: { m1: 1 } });
 
-    // 第二趟：同樣送 3 張，這次在送出前就被砍成 1 張 → 上游只收到 1 張，不再 400
-    const ch2 = await env.DB.prepare("SELECT * FROM relay_channels WHERE id=?1").bind(ch.id).first<any>();
-    let sent = "";
-    interceptOnce((b) => (sent = b));
+    // 第二趟：同樣送 3 張 → 這次**在打上游之前**就被擋下來（學到的 1 張已生效），
+    // 而且是回錯誤而不是偷砍。沒掛 interceptor＝上游根本不該被呼叫。
     const c2 = await chatCtx(u, {
-      channel: ch2.slug,
+      channel: ch.slug,
       model: "m1",
       messages: [{ role: "user", content: "再看一次", files: ids }]
     });
     const r2 = await chat(c2);
-    await readAll(r2);
     await drainWaits(c2);
-    expect(r2.status).toBe(200);
+    expect(r2.status).toBe(400);
+    expect(((await r2.json()) as any).hint).toContain("最多看 1 張圖");
+
+    // 第三趟：改送 1 張 → 通過，上游只收到 1 張
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+    const c3 = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "只給一張", files: [ids[0]] }]
+    });
+    const r3 = await chat(c3);
+    await readAll(r3);
+    await drainWaits(c3);
+    expect(r3.status).toBe(200);
     expect(sent.split("data:image/webp;base64,").length - 1).toBe(1);
   });
 
