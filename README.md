@@ -129,7 +129,7 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Honest comparison vs one-api / LiteLLM / OpenRouter / AI Gateway](./docs/COMPARISON.md) ·
 [Known debt](./DEBT.md) · [Security policy](./SECURITY.md)
 
-## Engineering evidence (v2.3.3)
+## Engineering evidence (v2.3.4)
 
 - **481 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
