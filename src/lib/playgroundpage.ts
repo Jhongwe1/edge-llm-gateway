@@ -68,6 +68,16 @@ const PG_CSS = `
   .md th,.md td{border:1px solid var(--line);padding:5px 10px;font-size:13.5px}
   .md a{color:var(--fg)}
   .md img{max-width:100%;height:auto;border-radius:8px}
+  /* 數學式（KaTeX）：長公式（積分、矩陣）在手機上一定會超出寬度 —— 讓它自己橫向捲，
+     不要把整個訊息氣泡撐破、也不要讓整頁出現橫向捲軸。 */
+  .md .katex-display{overflow-x:auto;overflow-y:hidden;margin:.85em 0;padding:2px 0}
+  .md .katex{font-size:1.05em}
+  .md .katex-error{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
+  /* 區塊公式的外殼是 span（<p> 裡不能放 <div>），要自己撐成整行才會置中、才有上下留白 */
+  .md .pgm[data-d="1"]{display:block}
+  /* KaTeX 還在下載時，這裡是原始 LaTeX。給等寬字＋淡一點，看起來像「還沒渲染完」
+     而不是「壞掉了」；載入失敗時也維持這個樣子，至少內容看得懂。 */
+  .md .pgm:not([data-done]){font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;opacity:.75}
   /* 等待中的三顆點 */
   .dots-w{display:inline-flex;gap:4px;padding:8px 0}
   .dots-w i{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:pgb 1s infinite}
@@ -191,6 +201,16 @@ export async function playgroundPageResponse(env: Env, request: Request): Promis
     '<script data-nonce src="' +
     assetSrc("pgattach.js") +
     '"></script>\n' +
+    // 數學式渲染（KaTeX）。同樣是按需 —— 這裡只給路徑與那支很小的協調程式，
+    // 真正的 KaTeX 本體（272KB＋字型）要等訊息裡真的出現 LaTeX 才下載。
+    '<script data-nonce>window.__KATEX={js:"' +
+    assetSrc("katex/katex.min.js") +
+    '",css:"' +
+    assetSrc("katex/katex.min.css") +
+    '"};</script>\n' +
+    '<script data-nonce src="' +
+    assetSrc("pgmath.js") +
+    '"></script>\n' +
     "<script data-nonce>" +
     MEMBER_JS +
     "</script>\n" +
@@ -266,15 +286,27 @@ const PG_JS = `
     }
   }
   function mdRender(text){
+    /* 數學區塊先抽走換成佔位符，否則 markdown 會把 \\lim_{x} … \\int_{5} 裡的兩個
+       底線當成斜體語法，中間整段被包進 <em>，公式就毀了。markdown 跑完再放回去，
+       最後由 PGM.render() 交給 KaTeX。細節見 public/assets/pgmath.js。 */
+    var store=[];
+    var src=text;
+    if(window.PGM&&PGM.has(text))src=PGM.protect(text,store);
     var raw=null;
     try{
-      if(window.marked&&marked.parse)raw=marked.parse(text,{breaks:true,async:false});
+      if(window.marked&&marked.parse)raw=marked.parse(src,{breaks:true,async:false});
     }catch(e){raw=null;}
     if(raw==null)return textHtml(text);
     var tpl=document.createElement("template");
     tpl.innerHTML=raw;
     sanitize(tpl.content);
-    return tpl.innerHTML;
+    var out=tpl.innerHTML;
+    return store.length?PGM.restore(out,store):out;
+  }
+  /* 把節點裡的 LaTeX 渲染成數學式。串流「中」刻意不做 —— 那時公式多半只有半截
+     （$$ 開了還沒關），渲染不但會失敗還會每一幀重跑一次。等收完再一次渲染。 */
+  function mathify(node){
+    if(node&&window.PGM)PGM.render(node);
   }
   function addPreCopy(md){
     var pres=md.querySelectorAll("pre");
@@ -798,7 +830,7 @@ const PG_JS = `
   function addAiMsg(content,final){
     var m=el("div","m ai");
     var md=el("div","md");
-    if(final){md.innerHTML=mdRender(content);addPreCopy(md);}
+    if(final){md.innerHTML=mdRender(content);addPreCopy(md);mathify(md);}
     else md.innerHTML='<span class="dots-w"><i></i><i></i><i></i></span>';
     m.appendChild(md);
     if(final&&content)addActions(m,content);
@@ -984,6 +1016,7 @@ const PG_JS = `
       msgs.push({role:"assistant",content:got,model:modelName()});
       node.md.innerHTML=mdRender(got);
       addPreCopy(node.md);
+      mathify(node.md);   /* 串流結束才渲染數學（中途公式常常只有半截） */
       addActions(node.box,got);
     }else{
       var d=node.md.querySelector(".dots-w");if(d)d.remove();
