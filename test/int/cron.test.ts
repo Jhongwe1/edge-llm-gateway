@@ -1,17 +1,19 @@
 // cron 派工（v2.0.0 Phase I）：Telegram 告警游標、rollup 冪等、R2 備份內容與保留、
 // 清理保留期、runJob 隔離（失敗寫 errlog＋cron_last_* 有 ok:false）。
 // 全部直呼 src/cron.ts 的具名函式（now 可注入 → 日期斷言確定性）。
-import { describe, it, expect, beforeAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import { env, fetchMock } from "cloudflare:test";
 import {
   tgAlertScan,
   rollupUsageDaily,
   backupToR2,
+  r2Guard,
   purgeOld,
   runCron,
   CRON_ALERTS,
   CRON_DAILY
 } from "../../src/cron.js";
+import { R2_PLAN, opKeys } from "../../src/lib/r2budget.js";
 import { envWith, seedUser } from "../helpers.js";
 
 beforeAll(() => {
@@ -177,6 +179,60 @@ describe("backupToR2", () => {
   it("無 BACKUPS 綁定 → 跳過不炸", async () => {
     const e2 = envWith({ BACKUPS: undefined });
     expect(await backupToR2(e2)).toContain("skip");
+  });
+
+  // 只管份數是不夠的：資料庫會長大，「14 份 × 一份多大」是會漂移的乘積。
+  // 沒有這條規則的話，備份可以安靜地把附件的空間吃光，兩邊加起來越過 10GB 免費額度。
+  it("備份合計超過預留空間 → 連份數還沒滿也要砍最舊的", async () => {
+    const big = "x".repeat(600 * 1024); // 每份 600KB
+    for (let i = 1; i <= 5; i++) {
+      await env.BACKUPS!.put("backup/2020-02-" + String(i).padStart(2, "0") + ".jsonl", big);
+    }
+    // 把預留空間當成 1MB 來測（真實值 1536MB，測試裡塞不出那麼多資料）
+    const spy = vi.spyOn(R2_PLAN, "backupMb", "get").mockReturnValue(1);
+    try {
+      await backupToR2(env, new Date("2026-02-09T12:00:00Z"));
+    } finally {
+      spy.mockRestore();
+    }
+    const listed = await env.BACKUPS!.list({ prefix: "backup/" });
+    const total = listed.objects.reduce((s, o) => s + Number(o.size), 0);
+    expect(total).toBeLessThanOrEqual(1024 * 1024);
+    expect(listed.objects.length).toBeLessThan(6); // 份數沒滿 14 也照砍
+    // 至少留最新那一份 —— 備份全砍光比超出預留空間更糟
+    expect(listed.objects.some((o) => o.key === "backup/2026-02-09.jsonl")).toBe(true);
+    // 量到的用量記進 settings，purgeOld 靠它算附件還剩多少空間
+    expect(parseInt((await getSetting("r2_backup_mb")) || "", 10)).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("r2Guard — 免費額度體檢", () => {
+  it("沒有任何 R2 綁定 → 跳過", async () => {
+    const e2 = envWith({ BACKUPS: undefined, FILES: undefined });
+    expect(await r2Guard(e2)).toContain("skip");
+  });
+
+  it("回報空間與本月操作用量（附件按 base64 的 4/3 實佔換算）", async () => {
+    await env.DB.prepare(
+      "INSERT INTO pg_files (user_id,kind,mime,name,bytes,storage,r2_key,purged,created_at) " +
+        "VALUES (1,'image','image/webp','a.webp',?1,'r2','pgfile/1/x',0,?2)"
+    )
+      .bind(3 * 1048576, new Date().toISOString())
+      .run();
+    const note = await r2Guard(env);
+    expect(note).toContain("空間");
+    expect(note).toContain("ClassA");
+    // 3MB 原始 → R2 實佔 4MB（4/3）；沒換算的話這裡會是 3
+    expect(note).toContain("附件 4");
+  });
+
+  it("清掉過期月份的操作計數鍵，留下本月的", async () => {
+    const cur = opKeys().a;
+    await env.DB.prepare("INSERT OR REPLACE INTO settings (k,v) VALUES (?1,'5')").bind(cur).run();
+    await env.DB.prepare("INSERT OR REPLACE INTO settings (k,v) VALUES ('r2a_2020-01','999')").run();
+    await r2Guard(env);
+    expect(await getSetting("r2a_2020-01")).toBeNull();
+    expect(await getSetting(cur)).toBe("5");
   });
 });
 

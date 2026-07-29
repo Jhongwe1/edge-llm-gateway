@@ -274,7 +274,7 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
               ceiling[k] +
               "（目前是 " +
               (store === "r2" ? "R2" : "純 D1") +
-              "儲存模式）—— " +
+              " 儲存模式）—— " +
               (store === "r2"
                 ? "再高就會吃掉 Cloudflare R2 每月 " + R2_FREE.storageMb / 1024 + "GB 免費額度"
                 : "再高就會超過 D1 的單值 2MB／免費庫 500MB 限制，寫入時才會失敗"),
