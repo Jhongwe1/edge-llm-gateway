@@ -119,7 +119,7 @@ flowchart LR
 [與 one-api／LiteLLM／OpenRouter／AI Gateway 的誠實對照](./docs/COMPARISON.md) ·
 [已知債務](./DEBT.md) · [安全政策](./SECURITY.md)
 
-## 工程證據（v2.3.0）
+## 工程證據（v2.3.1）
 
 - **481 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。

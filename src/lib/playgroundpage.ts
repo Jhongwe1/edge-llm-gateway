@@ -545,16 +545,22 @@ const PG_JS = `
     return false;
   }
 
-  /* ＋ 按下去做什麼：直接開檔案選擇器，不插一層「上傳照片／上傳檔案」的選單 ——
-     多一次點擊只為了選類別，而檔案選擇器本來就分得出來。
-     模型看不了圖時按鈕會變灰（見 updatePlus），這裡再講一次原因並把可選型別縮到文件，
-     免得使用者在選擇器裡挑了圖片、按了確定，才被告知不能用。 */
+  /* 附件功能的總開關：目前的模型看不了圖＝整個附件功能關閉。
+     這是站長 2026-07-29 拍板的行為 —— 一開始做成「灰色但仍可傳文件」（文件本來就不需要
+     vision），但那樣「灰掉的按鈕按下去還是跳出檔案選擇器」會讓人以為壞了。
+     一致、可預測比多留一點功能重要：要用附件就切一個看得懂圖的模型，文件也一起解鎖。 */
+  function attachBlocked(){
+    if(seesImages())return false;
+    MU.flash(tx("目前的模型看不了圖片 — 請換一個支援視覺的模型",
+                "This model can't read images — switch to a vision model"));
+    return true;
+  }
+
+  /* ＋ 按下去：直接開檔案選擇器，不插一層「上傳照片／上傳檔案」的選單 ——
+     多一次點擊只為了選類別，而檔案選擇器本來就分得出來。 */
   function attachClick(){
     if(!window.PGA){MU.flash(tx("附件功能載入失敗，請重新整理","Attachment module failed to load — please refresh"));return;}
-    if(!seesImages()){
-      MU.flash(tx("目前的模型看不了圖片 — 請換一個支援視覺的模型；文件（PDF／Word／Excel）不受影響",
-                  "This model can't read images — switch to a vision model; documents (PDF/Word/Excel) still work"));
-    }
+    if(attachBlocked())return;   /* 只提示，不開選擇器 */
     pickFiles();
   }
 
@@ -565,14 +571,13 @@ const PG_JS = `
     var ok=seesImages();
     UI.plus.classList.toggle("off",!ok);
     UI.plus.title=ok?tx("附加檔案","Attach files")
-      :tx("目前的模型看不了圖片（文件仍可上傳）","Current model can't read images (documents still work)");
+      :tx("目前的模型看不了圖片","Current model can't read images");
   }
 
   function pickFiles(){
     var inp=document.createElement("input");
     inp.type="file";inp.multiple=true;
-    /* 看不了圖的模型就不要讓人選到圖片 —— 選了也只會被擋下來 */
-    inp.accept=seesImages()?(PGA.acceptImage+","+PGA.acceptDoc):PGA.acceptDoc;
+    inp.accept=PGA.acceptImage+","+PGA.acceptDoc;
     inp.style.display="none";
     inp.addEventListener("change",function(){
       var fs=Array.prototype.slice.call(inp.files||[]);
@@ -587,14 +592,13 @@ const PG_JS = `
      每個檔案各自成敗、互不影響 —— 一個壞檔不該讓整批都白選。 */
   function addFiles(files){
     if(streaming){MU.flash(tx("回覆生成中 — 先按停止","Still streaming — stop it first"));return;}
+    /* 拖放與貼上也走這裡。跟 ＋ 按鈕擋在同一道門後面 —— 否則就會變成
+       「按鈕擋得住、把檔案拖進來卻可以」的隱藏後門，那種不一致最難跟使用者解釋。 */
+    if(attachBlocked())return;
     var maxBytes=1400*1024;   /* 跟伺服器 FILE_DEFAULTS.pgfile_max_kb 一致（超過那邊也會擋） */
     files.forEach(function(f){
       if(atts.length>=8){MU.flash(tx("一次最多 8 個附件","Up to 8 attachments at a time"));return;}
       if(PGA.isImage(f)){
-        if(!seesImages()){
-          MU.flash(tx("目前的模型看不了圖片","This model can't read images"));
-          return;
-        }
         var ph={kind:"image",name:f.name,bytes:f.size,busy:true,url:""};
         atts.push(ph);renderAtts();
         PGA.toImage(f,maxBytes).then(function(img){
