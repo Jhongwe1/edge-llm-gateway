@@ -125,7 +125,7 @@ flowchart LR
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。
   上游用 fetchMock 攔截，斷言「上游實際收到什麼」（標頭剝除、金鑰置換、串流位元組保真、
   demo 模式強制 max_tokens）。
-- **5 條 Playwright E2E**：真瀏覽器 × `wrangler dev` × mock SSE 上游 — 管理員發文→/news、
+- **6 條 Playwright E2E**：真瀏覽器 × `wrangler dev` × mock SSE 上游 — 管理員發文→/news、
   會員批准→真串流聊天、匿名 /vpn 隱形、demo 打滿→UI 顯示 429、公開 /api-docs 的
   互動式 OpenAPI 在 CSP 下真的起得來。
 - **兩支可重現的量測工具**，不是只有宣稱：`npm run bench` 重播 5982 筆合成增量，

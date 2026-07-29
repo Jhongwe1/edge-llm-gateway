@@ -115,3 +115,34 @@ test("/api-docs 公開可讀，互動式參考（Scalar）載入成功", async (
   // Scalar 起來後會渲染規格標題；3.6MB 懶載入給寬鬆時限
   await expect(page.locator("#scalarWrap")).toContainText("uaip.cc.cd API", { timeout: 30_000 });
 });
+
+// 迴歸測試（v2.3.4）：數學佔位符互咬。
+// 災情：pgmath.js 的佔位符前綴曾因「字面控制字元被存檔吃掉」退化成 M0、M1…M50，
+// restore 由前往後跑時 split("M5") 把 "M50" 切成兩半 —— 第 50 條公式被換成第 5 條的
+// 內容再接一個 "0"。使用者看到的是解題過程後半段變成 x → 50、x → 51、x → 52……
+// 而前 10 條是正常的（i<10 還沒撞上），所以上線當下沒被發現。
+// 這條測試用 60 條公式（跨過 10 與 50 的邊界）確保編號長短不會互相咬。
+test("數學渲染：60 條公式的佔位符不互咬，每條都對應到自己的 tex", async ({ page }) => {
+  await page.goto("/playground"); // 未登入也會載入 pgmath.js
+  await page.waitForFunction(() => !!(window as unknown as { PGM?: unknown }).PGM, null, {
+    timeout: 15_000
+  });
+  const r = await page.evaluate(() => {
+    const PGM = (window as unknown as { PGM: Record<string, (...a: unknown[]) => unknown> }).PGM;
+    const parts: string[] = [];
+    for (let i = 0; i < 60; i++) parts.push("步驟 " + i + "： $x + " + i + "$");
+    const store: unknown[] = [];
+    const src = PGM.protect(parts.join("\n"), store) as string;
+    const html = PGM.restore(src, store) as string;
+    return {
+      n: store.length,
+      texts: [...html.matchAll(/data-tex="([^"]*)"/g)].map((m) => m[1]),
+      leftover: /\uE000|\uE001/.test(html)
+    };
+  });
+  expect(r.n).toBe(60);
+  expect(r.leftover).toBe(false); // 佔位符必須全部被換掉
+  for (let i = 0; i < 60; i++) {
+    expect(r.texts[i], "第 " + i + " 條公式被別條污染了").toBe("x + " + i);
+  }
+});

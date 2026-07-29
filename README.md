@@ -136,7 +136,7 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced
   `max_tokens` in demo mode).
-- **5 Playwright E2E flows** against a real browser × `wrangler dev` × a mock SSE upstream:
+- **6 Playwright E2E flows** against a real browser × `wrangler dev` × a mock SSE upstream:
   admin publishes → `/news` renders; member approval → live streamed chat; anonymous `/vpn`
   invisibility; demo mode quota exhaustion → 429 surfaced in the UI; public `/api-docs`
   with the interactive OpenAPI reference actually booting under CSP.
