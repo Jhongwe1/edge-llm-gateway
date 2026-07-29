@@ -96,7 +96,7 @@ flowchart LR
     D[("D1 (SQLite)<br/>users · sessions · content ·<br/>req_log · errlog · audit · usage_daily")]
     DO["RateLimiter DO<br/>atomic check-and-count<br/>u:&lt;member&gt; · demo-ip:&lt;ip&gt; · demo:global"]
     CRON["cron ×2<br/>*/5 alert scan<br/>daily rollup+backup+purge"]
-    R2[("R2 · daily JSONL<br/>backups ×14")]
+    R2[("R2 (optional)<br/>attachments · daily JSONL<br/>backups ×14")]
     W --- A
     W --- D
     W --- DO
@@ -122,6 +122,7 @@ Design decisions are recorded as ADRs — the honest trade-offs, not just the wi
 - [ADR-0010 OpenAPI as a build artifact; public three-piece docs](./docs/adr/0010-openapi-three-piece-docs.md)
 - [ADR-0011 Staying on the free plan — the 10 ms CPU budget for streaming](./docs/adr/0011-streaming-cpu-budget.md)
 - [ADR-0012 Finishing the reply after the client disconnects](./docs/adr/0012-finish-reply-after-disconnect.md)
+- [ADR-0013 R2 is optional — attachments run in two storage modes](./docs/adr/0013-r2-optional-attachments.md)
 
 Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Security audit, two rounds + the miss rate of the first](./docs/AUDIT-2026-07.md) ·
@@ -129,9 +130,9 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Honest comparison vs one-api / LiteLLM / OpenRouter / AI Gateway](./docs/COMPARISON.md) ·
 [Known debt](./DEBT.md) · [Security policy](./SECURITY.md)
 
-## Engineering evidence (v2.3.4)
+## Engineering evidence (v2.4.0)
 
-- **481 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
+- **504 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced
@@ -172,6 +173,43 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 - **API documented three ways** (narrative `API.md`, hand-written `docs/openapi.yaml`,
   generated modules) with CI enforcing route-table × spec bidirectional equality — adding
   an endpoint without documenting it is a red build.
+
+## Storage modes: R2 is optional
+
+Chat attachments run in **two modes, chosen by whether the `FILES` R2 binding exists in
+`wrangler.toml`**. There is no flag and no migration — clone this repo without an R2
+bucket and everything still works.
+
+| | `FILES` binding absent | `FILES` binding present |
+|---|---|---|
+| where content lives | D1, `pg_files.b64` | R2 object, D1 keeps metadata + key |
+| single file | 1400 KB | **5 MB** |
+| per member | 30 MB | 200 MB |
+| site total | 300 MB | 6144 MB raw ( = 8 GB in R2) |
+| why that ceiling | D1 caps one value at 2,000,000 bytes | Cloudflare's 10 GB/month free tier |
+
+Switching is safe in both directions because **each row records its own location**
+(`pg_files.storage`): turning R2 on needs no data migration and old D1 files keep working;
+turning it off leaves R2-backed files showing the existing "file deleted" placeholder
+instead of breaking the page.
+
+Three things worth knowing before you change any of these numbers:
+
+- **R2 stores base64, not binary** — deliberately. Every upstream accepts only base64, so
+  binary storage means re-encoding each turn (8.11 ms/MB against a 10 ms CPU budget).
+  Space is paid once, CPU every turn. The 4/3 inflation is why "8 GB of R2" is written as
+  a 6144 MB quota: the quota counts original file size, R2 stores 1.334× that.
+- **Free-tier compliance is enforced in code**, not by watching a dashboard
+  (`src/lib/r2budget.ts`): admin-settable quotas are clamped to hard ceilings, a daily
+  cron measures real usage (attachments + backups) and evicts oldest-first against what is
+  actually left, and monthly Class A/B op budgets degrade gracefully — writes fall back to
+  D1, reads fall back to the placeholder. Deletes are free in R2 and never counted.
+- **Storing 5 MB is not sending 5 MB.** `PG_LIMITS.maxImgBytesTotal` still caps images
+  sent upstream at 1.5 MB per request — a CPU limit (ADR-0011), not a storage one — so the
+  browser keeps compressing toward the model budget rather than the storage limit.
+
+Full reasoning and the measurements behind it:
+[ADR-0013](./docs/adr/0013-r2-optional-attachments.md).
 
 ## Repository layout
 

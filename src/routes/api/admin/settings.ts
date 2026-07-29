@@ -33,7 +33,8 @@ import { adminOk, pgOpenAll } from "../../../lib/auth.js";
 import { QUOTA_DEFAULTS } from "../../../lib/quota.js";
 import { DEMO_DEFAULTS, demoCfg } from "../../../lib/demo.js";
 import { PG_DEFAULT_SYSTEM } from "../../../lib/playground.js";
-import { FILE_DEFAULTS } from "../../../lib/filestore.js";
+import { FILE_DEFAULTS, FILE_CEILING, activeStore } from "../../../lib/filestore.js";
+import { R2_FREE, R2_PLAN, r2Ops } from "../../../lib/r2budget.js";
 import { audit } from "../../../lib/observe.js";
 import type { RouteCtx } from "../../../types.js";
 
@@ -41,8 +42,10 @@ const QUOTA_KEYS = ["quota_relay_day", "quota_pg_day", "rl_per_min"];
 const DEMO_NUM_KEYS = ["demo_per_min", "demo_per_ip_day", "demo_global_day", "demo_max_tokens"];
 // Playground 附件的三層容量（2026-07-29 v2.3，預設值在 lib/filestore.ts FILE_DEFAULTS）：
 // 單檔 KB／每人 MB／全站 MB。跟 QUOTA_KEYS 走同一套語意（正整數，空字串＝刪鍵＝回預設）。
-// ⚠ pgfile_max_kb 調高要注意 D1 單值上限 2,000,000 bytes —— base64 會膨脹成 4/3 倍，
-// 超過 1464KB 就會在寫入時炸掉（存 R2 時才不受這條限制）。
+// **預設值與可設定範圍都跟著儲存模式走**（純 D1／D1+R2），因為兩邊的物理限制不同：
+// D1 卡在單值 2,000,000 bytes 與免費庫 500MB，R2 卡在免費額度 10GB／月。
+// 天花板寫死在 FILE_CEILING，這裡只負責把超過的請求擋下來並說清楚為什麼 ——
+// 「配額可設定」不能等於「免費額度可突破」，手滑多打一個 0 就開始收費是不能接受的。
 const FILE_KEYS = ["pgfile_max_kb", "pgfile_user_mb", "pgfile_total_mb"];
 const ALL_KEYS = [
   "brand",
@@ -83,6 +86,7 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
   const url = new URL(request.url);
   if (!(await adminOk(request, env, url))) return json({ error: "unauthorized" }, 401);
   if (!env.DB) return json({ error: "no-db" }, 500);
+  const store = activeStore(env); // 附件存哪：有 FILES 綁定＝r2，沒有＝d1
   try {
     const res = await env.DB.prepare(
       "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_open','pg_default_system','relay_meter'," +
@@ -149,9 +153,21 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
         demo_per_ip_day: DEMO_DEFAULTS.demo_per_ip_day,
         demo_global_day: DEMO_DEFAULTS.demo_global_day,
         demo_max_tokens: DEMO_DEFAULTS.demo_max_tokens,
-        pgfile_max_kb: FILE_DEFAULTS.pgfile_max_kb,
-        pgfile_user_mb: FILE_DEFAULTS.pgfile_user_mb,
-        pgfile_total_mb: FILE_DEFAULTS.pgfile_total_mb
+        pgfile_max_kb: FILE_DEFAULTS[store].pgfile_max_kb,
+        pgfile_user_mb: FILE_DEFAULTS[store].pgfile_user_mb,
+        pgfile_total_mb: FILE_DEFAULTS[store].pgfile_total_mb
+      },
+      // 附件儲存的現況（給 /settings 頁顯示，讓管理員知道自己在哪個模式、還剩多少）。
+      // mode：d1＝內容存在資料庫裡；r2＝存在 R2 桶裡（wrangler.toml 的 FILES 綁定決定）。
+      // ceiling：這個模式下三個欄位各自能填到多大 —— 前端拿去當 max 屬性與說明文字。
+      // ops：本月 R2 操作用量（只有 r2 模式才有意義），百分比是相對於我們自訂的預算
+      //      （免費額度的 90%），不是相對於 Cloudflare 的原始額度。
+      storage: {
+        mode: store,
+        ceiling: FILE_CEILING[store],
+        free: R2_FREE,
+        plan: R2_PLAN,
+        ops: store === "r2" ? await r2Ops(env, true) : null
       }
     });
   } catch (e: any) {
@@ -227,6 +243,8 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
         del("pg_default_system"); // 空＝回到內建 PG_DEFAULT_SYSTEM
       else put("pg_default_system", ps);
     }
+    const store = activeStore(env);
+    const ceiling = FILE_CEILING[store] as Record<string, number>;
     for (const k of QUOTA_KEYS.concat(FILE_KEYS)) {
       if (!(k in body)) continue;
       const v = body[k];
@@ -236,14 +254,32 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
       }
       const n = parseInt(v, 10);
       if (!Number.isFinite(n) || n < 1) {
+        const def =
+          (QUOTA_DEFAULTS as Record<string, number>)[k] ??
+          (FILE_DEFAULTS[store] as Record<string, number>)[k];
+        return json(
+          { error: "bad-input", hint: k + " 要是正整數，或 null＝回到內建預設（" + def + "）" },
+          400
+        );
+      }
+      // 附件三層有硬天花板（見 FILE_CEILING）。超過就擋，並且明講擋在哪、為什麼 ——
+      // 這是「確保不會超出免費額度」真正生效的地方，靜靜夾成上限反而會讓人以為設定成功了。
+      if (k in ceiling && n > ceiling[k]) {
         return json(
           {
             error: "bad-input",
             hint:
               k +
-              " 要是正整數，或 null＝回到內建預設（" +
-              (QUOTA_DEFAULTS as Record<string, number>)[k] +
-              "）"
+              " 最多只能設到 " +
+              ceiling[k] +
+              "（目前是 " +
+              (store === "r2" ? "R2" : "純 D1") +
+              "儲存模式）—— " +
+              (store === "r2"
+                ? "再高就會吃掉 Cloudflare R2 每月 " + R2_FREE.storageMb / 1024 + "GB 免費額度"
+                : "再高就會超過 D1 的單值 2MB／免費庫 500MB 限制，寫入時才會失敗"),
+            ceiling: ceiling[k],
+            mode: store
           },
           400
         );

@@ -2,7 +2,16 @@
 // 這三個是上傳端點的守門員：它們放行的東西會被「原封不動」串進上游請求的 JSON body，
 // 所以驗證錯誤不只是收到壞圖，而是整包請求的結構被破壞。
 import { describe, it, expect } from "vitest";
-import { sniffMime, b64Bytes, isB64, OK_IMAGE_MIME, FILE_DEFAULTS } from "../../src/lib/filestore.js";
+import {
+  sniffMime,
+  b64Bytes,
+  isB64,
+  mbText,
+  OK_IMAGE_MIME,
+  FILE_DEFAULTS,
+  FILE_CEILING
+} from "../../src/lib/filestore.js";
+import { R2_FREE, R2_PLAN, filesRawMbBudget, r2MbFromRawMb } from "../../src/lib/r2budget.js";
 import { cleanChannel } from "../../src/routes/api/admin/relay/channels/index.js";
 
 // 各格式的真實檔頭（前幾個 byte）→ base64
@@ -83,13 +92,56 @@ describe("isB64（字元集驗證＝字串串接快路徑的安全前提）", ()
   });
 });
 
-describe("配額預設值", () => {
+describe("配額預設值 — 純 D1 模式", () => {
   it("單檔上限反推 base64 後不超過 D1 單值 2MB 硬限制", () => {
     // base64 膨脹 4/3；超過 2,000,000 bytes 的話 D1 會直接拒絕寫入
-    expect(Math.ceil((FILE_DEFAULTS.pgfile_max_kb * 1024 * 4) / 3)).toBeLessThan(2000000);
+    expect(Math.ceil((FILE_DEFAULTS.d1.pgfile_max_kb * 1024 * 4) / 3)).toBeLessThan(2000000);
+  });
+  it("天花板本身也不能突破 D1 單值上限（管理員設到頂也要寫得進去）", () => {
+    expect(Math.ceil((FILE_CEILING.d1.pgfile_max_kb * 1024 * 4) / 3)).toBeLessThanOrEqual(2000000);
   });
   it("全站上限留了餘裕給正職資料（D1 免費庫 500MB）", () => {
-    expect(FILE_DEFAULTS.pgfile_total_mb).toBeLessThanOrEqual(300);
+    expect(FILE_DEFAULTS.d1.pgfile_total_mb).toBeLessThanOrEqual(300);
+    expect(FILE_CEILING.d1.pgfile_total_mb).toBeLessThanOrEqual(400);
+  });
+});
+
+describe("配額預設值 — R2 模式（守住 Cloudflare 免費額度）", () => {
+  it("單檔 5MB＝Anthropic vision 的每張圖硬上限", () => {
+    expect(FILE_DEFAULTS.r2.pgfile_max_kb).toBe(5 * 1024);
+  });
+  // 這是整組數字裡最容易錯、也最貴的一條：R2 存的是 base64（比原始檔大 4/3），
+  // 但配額比對的是原始 bytes。忘了換算就會實佔 10.9GB —— 沒有錯誤訊息，只有帳單。
+  it("三層配額換算成實際 R2 佔用後，加上備份與安全邊際仍在 10GB 內", () => {
+    const filesR2Mb = r2MbFromRawMb(FILE_CEILING.r2.pgfile_total_mb);
+    expect(filesR2Mb).toBeLessThanOrEqual(R2_PLAN.filesMb);
+    expect(filesR2Mb + R2_PLAN.backupMb + R2_PLAN.safetyMb).toBeLessThanOrEqual(R2_FREE.storageMb);
+  });
+  it("預算永遠訂在 Cloudflare 免費額度以下（操作次數）", () => {
+    expect(R2_PLAN.classA).toBeLessThan(R2_FREE.classA);
+    expect(R2_PLAN.classB).toBeLessThan(R2_FREE.classB);
+  });
+  it("備份把預留空間吃滿時，附件的可用額度會自動縮水", () => {
+    const roomy = filesRawMbBudget(0);
+    const tight = filesRawMbBudget(R2_PLAN.backupMb * 2);
+    expect(tight).toBeLessThan(roomy);
+    // 縮水後加上備份實佔仍不超過免費額度
+    expect(r2MbFromRawMb(tight) + R2_PLAN.backupMb * 2).toBeLessThanOrEqual(R2_FREE.storageMb);
+  });
+  it("備份大到把 10GB 吃光時，附件額度歸零而不是變成負數", () => {
+    expect(filesRawMbBudget(99999)).toBe(0);
+  });
+});
+
+describe("mbText — 上限提示的數字要跟實際擋的一致", () => {
+  it("1400KB 顯示 1.4MB（舊版四捨五入成「1MB」，跟實際擋線對不上）", () => {
+    expect(mbText(1400)).toBe("1.4MB");
+  });
+  it("整數 MB 不長出小數點", () => {
+    expect(mbText(5120)).toBe("5MB");
+  });
+  it("1MB 以下用 KB", () => {
+    expect(mbText(512)).toBe("512KB");
   });
 });
 

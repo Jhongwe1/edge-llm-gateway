@@ -9,22 +9,54 @@
 // 詳細對照表寫在 migrations/0007。**這條規則對 R2 一樣成立** —— R2 也存 base64 字串，
 // 存二進位省下的 33% 空間會被「每輪重編一次」的 CPU 加倍奉還。
 //
-// ## D1／R2 可切換（C 方案）
+// ## 兩種儲存模式（D1-only ／ D1+R2），靠綁定在不在切換
+//
 // 有 env.FILES（R2 綁定）就寫 R2、沒有就寫 D1 的 b64 欄位，跟 cron.ts 判斷 env.BACKUPS
 // 是同一套寫法。關鍵在**每一列各自記自己存在哪**（storage 欄位）：所以開通 R2 之後
 // 舊檔照樣讀得到，不需要搬資料、不需要停機、也不需要改任何呼叫端。
+// 反向也成立 —— 把 wrangler.toml 的 FILES 綁定拿掉就退回純 D1 模式，
+// 已經在 R2 的舊檔會讀不到內容（顯示「檔案已刪除」佔位），但站台不會壞。
+// 決策紀錄：docs/adr/0013-r2-optional-attachments.md
 import type { Env, Row } from "../types.js";
+import { FILES_RAW_MB, r2Ops, bumpOps } from "./r2budget.js";
 
 // 三層配額的內建預設（settings 同名鍵可覆寫，管理員在 /settings 改）。
+// **兩種模式各一組** —— 限制的來源完全不同，共用一組數字只會兩邊都不合身：
+//
+// d1：受 D1 本身的物理限制
 //   單檔 1400KB — D1 單值上限 2,000,000 bytes 反推：base64 會膨脹成 ceil(n/3)*4，
 //     所以原始檔最大是 2,000,000 × 3/4 ≈ 1,464KB，取 1400KB 留餘裕。
 //     （初版寫 1500KB 是算錯的 —— 1500×1024×4/3 = 2,048,000，剛好越過 D1 的線，
 //     會在寫入時才炸，而且錯誤訊息跟大小完全無關。單元測試把這條算式釘起來了。）
-//     存 R2 時不受這條限制，但預設不放寬：前端本來就壓到長邊 1568px，一般照片 200–400KB。
-//   每人 30MB — 防「一個人把別人的圖擠掉」。沒有這層的話 L3 的 FIFO 淘汰是不公平的：
-//     它只知道誰比較舊，不知道誰該被淘汰，單人灌爆就會清光所有人的歷史。
-//   全站 300MB — 硬天花板。D1 免費庫上限 500MB，留 200MB 給對話／訪客紀錄等正職資料。
-export const FILE_DEFAULTS = { pgfile_max_kb: 1400, pgfile_user_mb: 30, pgfile_total_mb: 300 };
+//   每人 30MB／全站 300MB — D1 免費庫 500MB，留 200MB 給對話／訪客紀錄等正職資料。
+//
+// r2：受 Cloudflare R2 免費額度限制（10GB／月），數字的來源見 lib/r2budget.ts
+//   單檔 5MB — R2 沒有單值上限，這個數字是**上游 vision API** 訂的：Anthropic 每張圖
+//     硬上限就是 5MB。再往上放寬只會換來上游 400，不會換到任何可用的功能。
+//   每人 200MB／全站 6144MB — 全站這個數字是「8GB 的 R2 空間」換算來的：R2 存的是
+//     base64，比原始檔大 4/3，而配額比對的是原始大小，所以 8192×3/4＝6144（見 R2_PLAN
+//     旁邊那段說明）。少了這道換算就會實佔 10.9GB，安靜地越過 10GB 免費額度。
+//
+// ⚠ 注意「存得下」不等於「模型看得到」：單次對話能送給上游的圖片總量另外受
+// PG_LIMITS.maxImgBytesTotal（1.5MB）限制，那條是**CPU** 換算出來的，跟儲存無關，
+// 換到 R2 也不會變。前端因此仍然把圖壓到那條線以內（見 playgroundpage.ts）。
+export const FILE_DEFAULTS = {
+  d1: { pgfile_max_kb: 1400, pgfile_user_mb: 30, pgfile_total_mb: 300 },
+  r2: { pgfile_max_kb: 5120, pgfile_user_mb: 200, pgfile_total_mb: FILES_RAW_MB }
+};
+
+// 管理員在 /settings 改設定時的**硬天花板**（程式寫死，API 只能往下調）。
+// 沒有這層的話，「三層配額可由管理員設定」就等於「免費額度可由管理員突破」——
+// 手滑打多一個 0 就開始收費，而且是安靜地收。
+//   d1.maxKb 1464 是 D1 單值 2,000,000 bytes 的數學上限，再高必定寫入失敗。
+//   d1.totalMb 400 留 100MB 給正職資料（D1 免費庫 500MB）。
+//   r2.maxKb 10240 是 CPU 換算的：回讀時要把 base64 解成二進位餵給 <img>，
+//     實測 5MB→2.96ms、10MB→約 6ms，再往上就吃掉免費方案 10ms 的一半以上。
+//   r2.userMb 2048＝單人最多佔全站的 1/4，維持 FIFO 淘汰的公平性。
+export const FILE_CEILING = {
+  d1: { pgfile_max_kb: 1464, pgfile_user_mb: 300, pgfile_total_mb: 400 },
+  r2: { pgfile_max_kb: 10240, pgfile_user_mb: 2048, pgfile_total_mb: FILES_RAW_MB }
+};
 
 // 只收這四種 —— 三家 vision 的交集（Anthropic 明文就這四種）。
 // SVG 永遠不在名單裡：它是可以裝 <script> 的 XML，等於讓會員往站上傳可執行內容。
@@ -96,12 +128,43 @@ export interface FileRow extends Row {
   created_at: string;
 }
 
-/** 讀三層配額設定（settings 覆寫 → 內建預設）。任何失敗都退回內建值。 */
-export async function fileLimits(env: Env): Promise<{ maxKb: number; userMb: number; totalMb: number }> {
+/**
+ * KB 數字 → 給人看的字串（1400→「1.4MB」、5120→「5MB」）。
+ * 存在的理由很實際：舊版提示寫 Math.round(1400/1024)＝「1MB」，但實際擋在 1.37MB ——
+ * 使用者壓到 1.2MB 被收下、壓到 1.3MB 也被收下，訊息卻說上限 1MB，看起來像隨機故障。
+ */
+export function mbText(kb: number): string {
+  const n = Number(kb) || 0;
+  if (n < 1024) return n + "KB";
+  const mb = n / 1024;
+  return (Math.round(mb * 10) / 10).toString() + "MB";
+}
+
+/** 這個站設定上是哪一種儲存模式 —— R2 綁定在就是 r2，否則 d1。 */
+export function activeStore(env: Env): "d1" | "r2" {
+  return env && env.FILES ? "r2" : "d1";
+}
+
+/**
+ * 讀三層配額（模式預設 → settings 覆寫 → 天花板夾擠）。任何失敗都退回內建值。
+ *
+ * 夾擠（clamp）是刻意跟 API 端的驗證重複的：settings 表裡可能留著「加天花板之前」寫進去
+ * 的值，也可能有人直接改資料庫。讀的時候夾一次，才是真的保證跑不出免費額度。
+ *
+ * ⚠ 這裡看的是 activeStore（**東西存在哪**）而不是「這次要寫去哪」：Class A 預算用完時
+ * 新檔會退回 D1，但已經躺在 R2 的 8GB 不該因此被當成超量清掉。單檔上限另外算，見 uploadPlan。
+ */
+export async function fileLimits(
+  env: Env
+): Promise<{ maxKb: number; userMb: number; totalMb: number; store: "d1" | "r2" }> {
+  const store = activeStore(env);
+  const def = FILE_DEFAULTS[store];
+  const cap = FILE_CEILING[store];
   const out = {
-    maxKb: FILE_DEFAULTS.pgfile_max_kb,
-    userMb: FILE_DEFAULTS.pgfile_user_mb,
-    totalMb: FILE_DEFAULTS.pgfile_total_mb
+    maxKb: def.pgfile_max_kb,
+    userMb: def.pgfile_user_mb,
+    totalMb: def.pgfile_total_mb,
+    store: store
   };
   try {
     const rs = await env.DB.prepare(
@@ -110,17 +173,33 @@ export async function fileLimits(env: Env): Promise<{ maxKb: number; userMb: num
     for (const r of (rs.results || []) as { k: string; v: string }[]) {
       const n = parseInt(String(r.v), 10);
       if (!Number.isFinite(n) || n <= 0) continue; // 0／負數／空白＝誤設，用預設而不是把功能鎖死
-      if (r.k === "pgfile_max_kb") out.maxKb = n;
-      else if (r.k === "pgfile_user_mb") out.userMb = n;
-      else if (r.k === "pgfile_total_mb") out.totalMb = n;
+      if (r.k === "pgfile_max_kb") out.maxKb = Math.min(n, cap.pgfile_max_kb);
+      else if (r.k === "pgfile_user_mb") out.userMb = Math.min(n, cap.pgfile_user_mb);
+      else if (r.k === "pgfile_total_mb") out.totalMb = Math.min(n, cap.pgfile_total_mb);
     }
   } catch (e) {}
   return out;
 }
 
-/** 這個站現在把附件寫到哪 —— R2 綁定在就是 r2，否則 d1。 */
-export function activeStore(env: Env): "d1" | "r2" {
-  return env && env.FILES ? "r2" : "d1";
+/**
+ * 這一次上傳實際要寫去哪，以及它的單檔上限。
+ *
+ * R2 模式下若本月 Class A（寫入類操作）預算用完，就**退回 D1**而不是拒收 ——
+ * 單檔上限跟著縮回 D1 的 1400KB，所以呼叫端拿這個值去擋大小，使用者收到的是
+ * 「這張圖太大」而不是「存檔失敗」。degraded=true 讓呼叫端可以在提示裡說明原因。
+ */
+export async function uploadPlan(
+  env: Env
+): Promise<{ store: "d1" | "r2"; maxKb: number; degraded: boolean }> {
+  const lim = await fileLimits(env);
+  if (lim.store === "d1") return { store: "d1", maxKb: lim.maxKb, degraded: false };
+  const ops = await r2Ops(env);
+  if (ops.aOk) return { store: "r2", maxKb: lim.maxKb, degraded: false };
+  return {
+    store: "d1",
+    maxKb: Math.min(lim.maxKb, FILE_DEFAULTS.d1.pgfile_max_kb),
+    degraded: true
+  };
 }
 
 /**
@@ -139,12 +218,14 @@ export async function putFile(
     w: number | null;
     h: number | null;
   },
-  b64: string
+  b64: string,
+  store?: "d1" | "r2"
 ): Promise<number> {
   const now = new Date().toISOString();
-  const store = activeStore(env);
+  // 呼叫端通常已經算過 uploadPlan（要拿 maxKb 擋大小），就把結果帶進來，不必再算一次
+  const dest = store || (await uploadPlan(env)).store;
   let r2Key: string | null = null;
-  if (store === "r2") {
+  if (dest === "r2") {
     r2Key = "pgfile/" + meta.user_id + "/" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
     // 存的是 base64 字串本身（見檔頭說明），contentType 標 text/plain 才不會被誤當成圖片下載
     await env.FILES!.put(r2Key, b64, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
@@ -161,13 +242,28 @@ export async function putFile(
       meta.bytes,
       meta.w,
       meta.h,
-      store,
-      store === "d1" ? b64 : null,
+      dest,
+      dest === "d1" ? b64 : null,
       r2Key,
       now
     )
     .run();
+  // PutObject＝1 次 Class A。記在 D1 寫入之後：物件真的放上去了才算數。
+  if (dest === "r2") await bumpOps(env, "a", 1);
   return r.meta.last_row_id as number;
+}
+
+/**
+ * 記錄「這次請求讀了幾個 R2 物件」（GetObject＝Class B）。
+ * 刻意做成呼叫端一次記一批，而不是塞進 getB64 裡一次記一個：翻一則有 4 張圖的對話
+ * 是 4 次 R2 讀取，但只該換來 1 次 D1 寫入 —— 不然計數器本身就變成新的成本來源。
+ * 有 ctx 的路徑請丟 waitUntil（計數不該讓使用者多等）。
+ */
+export async function countR2Reads(env: Env, rows: FileRow[]): Promise<void> {
+  const n = (rows || []).filter(function (r) {
+    return r && r.storage === "r2" && !r.purged;
+  }).length;
+  if (n) await bumpOps(env, "b", n);
 }
 
 /**
@@ -178,6 +274,12 @@ export async function getB64(env: Env, row: FileRow): Promise<string | null> {
   if (!row || row.purged) return null;
   if (row.storage === "r2") {
     if (!env.FILES || !row.r2_key) return null;
+    // 本月 Class B 預算用完＝當成讀不到。刻意跟「R2 掛掉」走同一條降級路徑：
+    // 呼叫端本來就要處理讀不到（顯示佔位），這裡不需要第二種錯誤語意。
+    // 正常使用一個月連 1% 都用不到（瀏覽器有 7 天 immutable 快取），會走到這裡
+    // 只有一種可能 —— 有人拿登入身分寫迴圈掃，那本來就該被擋下。
+    const ops = await r2Ops(env);
+    if (!ops.bOk) return null;
     try {
       const obj = await env.FILES.get(row.r2_key);
       if (!obj) return null;
@@ -211,6 +313,8 @@ export async function purgeContent(env: Env, rows: FileRow[]): Promise<number> {
       });
     if (keys.length) {
       try {
+        // DeleteObject 在 R2 是**免費操作**（不算 Class A 也不算 Class B），
+        // 所以清理路徑不必看預算、也不必計數 —— 想清多少就清多少。
         await env.FILES.delete(keys);
       } catch (e) {}
     }

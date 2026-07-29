@@ -15,7 +15,16 @@ import { json } from "../../../../lib/site.js";
 import { getSessionUser, goodOrigin, isAdminUser } from "../../../../lib/auth.js";
 import { pgUser } from "../../../../lib/playground.js";
 import { demoCfg, demoUser, demoCheck } from "../../../../lib/demo.js";
-import { fileLimits, putFile, sniffMime, isB64, b64Bytes, OK_IMAGE_MIME } from "../../../../lib/filestore.js";
+import {
+  fileLimits,
+  uploadPlan,
+  putFile,
+  sniffMime,
+  isB64,
+  b64Bytes,
+  mbText,
+  OK_IMAGE_MIME
+} from "../../../../lib/filestore.js";
 import type { RouteCtx, UserRow } from "../../../../types.js";
 
 export async function onRequestPost(context: RouteCtx): Promise<Response> {
@@ -63,12 +72,20 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
 
   const bytes = b64Bytes(b64);
   const lim = await fileLimits(env);
-  const maxBytes = lim.maxKb * 1024;
+  // 單檔上限看的是「這次要寫去哪」而不是站台模式：R2 模式下若本月寫入預算用完，
+  // 這次會退回 D1，上限也跟著縮回 D1 的那條線（degraded=true）。先擋大小再寫，
+  // 使用者收到的才是「圖太大」，而不是寫到一半的「存檔失敗」。
+  const plan = await uploadPlan(env);
+  const maxBytes = plan.maxKb * 1024;
   if (bytes > maxBytes) {
     return json(
       {
         error: "too-large",
-        hint: "壓縮後仍超過 " + Math.round(lim.maxKb / 1024) + "MB，請換小一點的圖",
+        hint:
+          "壓縮後仍超過 " +
+          mbText(plan.maxKb) +
+          "，請換小一點的圖" +
+          (plan.degraded ? "（本月 R2 寫入額度已用完，暫時只能存進資料庫）" : ""),
         bytes: bytes,
         limit: maxBytes
       },
@@ -123,9 +140,10 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
     const id = await putFile(
       env,
       { user_id: user.id, kind: "image", mime: mime, name: name, bytes: bytes, w: w, h: h },
-      b64
+      b64,
+      plan.store
     );
-    return json({ id: id, mime: mime, name: name, bytes: bytes, w: w, h: h });
+    return json({ id: id, mime: mime, name: name, bytes: bytes, w: w, h: h, store: plan.store });
   } catch (e: any) {
     return json({ error: "save-failed", detail: String((e && e.message) || e) }, 500);
   }

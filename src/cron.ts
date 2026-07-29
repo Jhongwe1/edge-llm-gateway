@@ -2,7 +2,7 @@
 //
 // 兩條排程（wrangler.toml [triggers]）：
 //   "*/5 * * * *"  → tgAlertScan：掃 errlog 增量、推 Telegram（/settings 或 secrets 未設＝跳過）
-//   "17 19 * * *"  → rollupUsageDaily ＋ backupToR2 ＋ purgeOld（UTC 19:17＝台北 03:17 低峰）
+//   "17 19 * * *"  → rollupUsageDaily ＋ backupToR2 ＋ r2Guard ＋ purgeOld（UTC 19:17＝台北 03:17 低峰）
 //
 // 紀律：每個 job 各自 try/catch 隔離 — 一個壞不拖累其他；結果寫 settings cron_last_<job>
 // （JSON {ts,ok,note|err}，/logs 或 API 隨時可查），失敗另寫 errlog（src=cron.<job>），
@@ -11,6 +11,7 @@
 import { reportErrorNow } from "./lib/observe.js";
 import { deleteFiles, evictOldest, fileLimits } from "./lib/filestore.js";
 import type { FileRow } from "./lib/filestore.js";
+import { R2_FREE, R2_PLAN, bumpOps, filesRawMbBudget, opKeys, r2MbFromRawMb, r2Ops } from "./lib/r2budget.js";
 import type { Env, Row } from "./types.js";
 
 export const CRON_ALERTS = "*/5 * * * *";
@@ -114,7 +115,8 @@ const BACKUP_TABLES: { t: string; cols: string }[] = [
 
 /**
  * 全庫 JSONL 備份到 R2（binding BACKUPS）：物件 backup/<UTC日>.jsonl，
- * 一列一行 {"t":"users","r":{…}}；同日重跑覆寫同物件（冪等）。保留最近 14 份、其餘刪除。
+ * 一列一行 {"t":"users","r":{…}}；同日重跑覆寫同物件（冪等）。
+ * 保留最近 14 份，且合計不超過 R2_PLAN.backupMb —— 兩條規則都砍最舊的，理由見函式內。
  */
 export async function backupToR2(env: Env, now?: Date): Promise<string> {
   if (!env.BACKUPS) return "skip：無 BACKUPS 綁定";
@@ -143,12 +145,109 @@ export async function backupToR2(env: Env, now?: Date): Promise<string> {
   const key = "backup/" + day + ".jsonl";
   await env.BACKUPS.put(key, out, { httpMetadata: { contentType: "application/jsonl" } });
 
-  // 保留 14 份：列出 backup/ 前綴、鍵名字典序＝日期序，砍最舊的
+  // 保留規則有兩條，**份數與大小都要管**：
+  //   1) 最多 14 份（原本就有的規則）
+  //   2) 合計不超過 R2_PLAN.backupMb 的預留空間
+  // 只管份數是不夠的：資料庫會長大，14 份 × 一份多大 是個會漂移的乘積 ——
+  // 哪天單份漲到 200MB，14 份就是 2.8GB，把附件的空間吃掉還渾然不知。
+  // 兩條規則都是「砍最舊的」（鍵名字典序＝日期序）。
   const listed = await env.BACKUPS.list({ prefix: "backup/" });
-  const keys = listed.objects.map((o) => o.key).sort();
-  const excess = keys.slice(0, Math.max(0, keys.length - 14));
-  for (const k of excess) await env.BACKUPS.delete(k);
-  return key + "（" + total + " 列" + (excess.length ? "；清掉 " + excess.length + " 份舊備份" : "") + "）";
+  const objs = listed.objects
+    .map((o) => ({ key: o.key, size: Number(o.size) || 0 }))
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const doomed = objs.slice(0, Math.max(0, objs.length - 14));
+  const keep = objs.slice(doomed.length);
+  let keepBytes = keep.reduce((s, o) => s + o.size, 0);
+  const capBytes = R2_PLAN.backupMb * 1024 * 1024;
+  let i = 0;
+  while (keepBytes > capBytes && i < keep.length - 1) {
+    // 至少留最新那一份 —— 備份全砍光比超出預留空間更糟
+    keepBytes -= keep[i].size;
+    doomed.push(keep[i]);
+    i++;
+  }
+  for (const o of doomed) await env.BACKUPS.delete(o.key); // DeleteObject 免費，不必計數
+  // 備份實際佔用多少 R2 空間 → 記進 settings，purgeOld 拿它算「附件還剩多少空間」，
+  // 不必自己再列一次桶（ListObjects 是 Class A，能省則省）。
+  const usedMb = Math.ceil(keepBytes / 1048576);
+  await putSetting(env, "r2_backup_mb", String(usedMb));
+  // PutObject ＋ ListObjects ＝ 2 次 Class A
+  await bumpOps(env, "a", 2);
+  return (
+    key +
+    "（" +
+    total +
+    " 列；保留 " +
+    (objs.length - doomed.length) +
+    " 份／" +
+    usedMb +
+    "MB" +
+    (doomed.length ? "；清掉 " + doomed.length + " 份舊備份" : "") +
+    "）"
+  );
+}
+
+/**
+ * R2 免費額度的每日體檢（2026-07-29）。只看不動 —— 真正的回收動作在 purgeOld，
+ * 這裡負責「量出真實用量、超過警戒線就告警、順手清掉過期的計數鍵」。
+ *
+ * 為什麼要獨立一個 job：儲存空間是三條免費額度線裡唯一會**安靜**超出的（操作次數超了
+ * 只是被降級，看得出來；空間超了只有帳單會說話）。所以它值得一個每天都會留下紀錄的
+ * 檢查點 —— cron_last_r2guard 裡永遠有一行「今天用了多少」。
+ */
+export async function r2Guard(env: Env): Promise<string> {
+  if (!env.FILES && !env.BACKUPS) return "skip：沒有任何 R2 綁定";
+
+  // 附件實際佔用的 R2 空間＝原始 bytes × 4/3（存的是 base64，見 lib/r2budget.ts）
+  const cur = await env.DB.prepare(
+    "SELECT COALESCE(SUM(bytes),0) AS s FROM pg_files WHERE storage='r2' AND purged=0"
+  ).first<{ s: number }>();
+  const filesRawMb = Math.ceil((Number(cur && cur.s) || 0) / 1048576);
+  const filesR2Mb = r2MbFromRawMb(filesRawMb);
+  const backupMb = parseInt((await getSetting(env, "r2_backup_mb")) || "", 10) || 0;
+  const totalMb = filesR2Mb + backupMb;
+  const pct = Math.round((totalMb / R2_FREE.storageMb) * 100);
+
+  const ops = await r2Ops(env, true);
+
+  // 過期的月份計數鍵（保留本月與上個月，其餘刪掉，不讓 settings 表無限長出新列）
+  const keepA = opKeys().a;
+  const keepB = opKeys().b;
+  const prev = opKeys(new Date(Date.now() - 32 * 86400e3));
+  await env.DB.prepare(
+    "DELETE FROM settings WHERE (k LIKE 'r2a\\_%' ESCAPE '\\' OR k LIKE 'r2b\\_%' ESCAPE '\\') " +
+      "AND k NOT IN (?1,?2,?3,?4)"
+  )
+    .bind(keepA, keepB, prev.a, prev.b)
+    .run();
+
+  const note =
+    "空間 " +
+    totalMb +
+    "/" +
+    R2_FREE.storageMb +
+    "MB（" +
+    pct +
+    "%；附件 " +
+    filesR2Mb +
+    "＋備份 " +
+    backupMb +
+    "）｜本月 ClassA " +
+    ops.a +
+    "（" +
+    ops.aPct +
+    "%）ClassB " +
+    ops.b +
+    "（" +
+    ops.bPct +
+    "%）";
+
+  // 任何一條過警戒線就當成錯誤事件寫進 errlog —— 五分鐘後的 tgAlertScan 會把它推到
+  // Telegram。刻意不自己發訊息：告警路徑只有一條，才不會有「有些告警會通知、有些不會」。
+  if (pct >= R2_PLAN.warnPct || ops.aPct >= R2_PLAN.warnPct || ops.bPct >= R2_PLAN.warnPct) {
+    await reportErrorNow(env, "cron.r2guard", "R2 免費額度已用到警戒線：" + note);
+  }
+  return note;
 }
 
 // 保留期限（天）。改這裡就好 —— 三個數字都在同一個地方，不必翻 SQL。
@@ -228,10 +327,18 @@ export async function purgeOld(env: Env, now?: Date): Promise<string> {
   } catch (e) {}
 
   // 4) L3 全站容量淘汰：超過上限就從最舊的開始清內容（中繼資料留著顯示「檔案已刪除」）
+  //    R2 模式下取兩條線的**小**者：管理員設定的 pgfile_total_mb，以及「10GB 免費額度
+  //    扣掉備份實際佔用與安全邊際後還剩多少」。後者是會浮動的 —— 備份長大時附件就得
+  //    讓位，不然兩邊加起來越過 10GB，而那是唯一不會有任何錯誤訊息的超法。
   let evicted = 0;
   try {
     const lim = await fileLimits(env);
-    evicted = await evictOldest(env, lim.totalMb);
+    let cap = lim.totalMb;
+    if (lim.store === "r2") {
+      const backupMb = parseInt((await getSetting(env, "r2_backup_mb")) || "", 10);
+      cap = Math.min(cap, filesRawMbBudget(Number.isFinite(backupMb) ? backupMb : undefined));
+    }
+    evicted = await evictOldest(env, cap);
   } catch (e) {}
 
   notes.push(
@@ -286,6 +393,9 @@ export async function runCron(cron: string, env: Env, now?: Date): Promise<void>
   if (isDaily || all) {
     await runJob(env, "rollup", () => rollupUsageDaily(env, now));
     await runJob(env, "backup", () => backupToR2(env, now));
+    // 順序有意義：backup 先跑（它會量出備份佔多少空間並記下來），
+    // r2guard 才算得出附件還剩多少額度，purge 最後照那個額度回收。
+    await runJob(env, "r2guard", () => r2Guard(env));
     await runJob(env, "purge", () => purgeOld(env, now));
   }
   if (isAlerts || all) {

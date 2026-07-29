@@ -52,13 +52,26 @@ new_sqlite_classes = ["RateLimiter"]
 [triggers]
 crons = ["*/5 * * * *", "17 19 * * *"]
 
-# R2 備份桶（Phase I）：每日全庫 JSONL（media 的 BLOB 排除）、保留 14 份。
-# ⚠ 帳號尚未開通 R2（2026-07-17 建桶回 code 10042）——到 Dashboard 開通 R2、
-# `npx wrangler r2 bucket create uaip-backups` 成功後，取消下面三行註解再部署。
-# 沒綁定期間備份 job 會跳過（cron_last_backup 記 skip），其他 cron 照跑。
-#[[r2_buckets]]
-#binding = "BACKUPS"
-#bucket_name = "uaip-backups"
+# ── R2 儲存（2026-07-29 帳號開通後啟用；在此之前整站是純 D1）──────────────────
+#
+# 這兩個綁定都是**可選的**：拿掉就退回純 D1 模式，程式照跑、不必改任何一行程式碼。
+#   BACKUPS 沒綁 → 每日備份 job 跳過（cron_last_backup 記 skip），其他 cron 照跑。
+#   FILES   沒綁 → Playground 附件寫進 D1 的 b64 欄位，單檔上限跟著縮回 1400KB。
+# 兩種模式的完整說明在 docs/adr/0013-r2-optional-attachments.md 與 README「儲存模式」。
+
+# 備份桶：每日全庫 JSONL（media 的 BLOB 排除）、保留 14 份。
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "uaip-backups"
+
+# 附件桶：Playground 的圖片附件（存 base64 字串，不是二進位 —— 理由見 lib/filestore.ts）。
+# 綁定在＝新附件寫 R2、單檔放寬到 5MB；每一列自己記存在哪（pg_files.storage），
+# 所以切換模式不必搬資料，舊檔照樣讀得到。
+# ⚠ 免費額度（10GB 儲存／Class A 100 萬／Class B 1000 萬 每月）的守門在 lib/r2budget.ts，
+# 上限是程式寫死的天花板，管理員在 /settings 只能往下調、不能往上突破。
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "uaip-files"
 
 # 本機 wrangler dev 用 localhost 當 request.url 的 host（不設的話會拿 routes 的正式網域，
 # localhost 免金鑰／dev 登入表單全會失效）。只影響本機，不影響部署。

@@ -86,7 +86,7 @@ flowchart LR
     D[("D1（SQLite）<br/>會員·session·內容·<br/>req_log·errlog·audit·usage_daily")]
     DO["RateLimiter DO<br/>原子檢查並計數<br/>u:會員 · demo-ip:IP · demo:global"]
     CRON["cron ×2<br/>*/5 告警掃描<br/>每日聚合＋備份＋清理"]
-    R2[("R2 · 每日 JSONL<br/>備份保留 14 份")]
+    R2[("R2（可選）<br/>附件 · 每日 JSONL<br/>備份保留 14 份")]
     W --- A
     W --- D
     W --- DO
@@ -112,6 +112,7 @@ flowchart LR
 - [ADR-0010 OpenAPI 是建置產物；文件公開三件套](./docs/adr/0010-openapi-three-piece-docs.md)
 - [ADR-0011 為了續用免費方案 — 串流的 10ms CPU 預算](./docs/adr/0011-streaming-cpu-budget.md)
 - [ADR-0012 斷線後把回覆跑完再存](./docs/adr/0012-finish-reply-after-disconnect.md)
+- [ADR-0013 R2 是可選的 — 附件有兩種儲存模式](./docs/adr/0013-r2-optional-attachments.md)
 
 另見：[真實數據報告](./docs/REPORT.md) ·
 [安全稽核：兩輪，以及第一輪的漏檢率](./docs/AUDIT-2026-07.md) ·
@@ -119,9 +120,9 @@ flowchart LR
 [與 one-api／LiteLLM／OpenRouter／AI Gateway 的誠實對照](./docs/COMPARISON.md) ·
 [已知債務](./DEBT.md) · [安全政策](./SECURITY.md)
 
-## 工程證據（v2.3.4）
+## 工程證據（v2.4.0）
 
-- **481 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
+- **504 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。
   上游用 fetchMock 攔截，斷言「上游實際收到什麼」（標頭剝除、金鑰置換、串流位元組保真、
   demo 模式強制 max_tokens）。
@@ -152,6 +153,38 @@ flowchart LR
   告警掃描 — 每個 job 隔離、自我回報（`settings.cron_last_*`），job 自己壞了也會進告警。
 - **API 三件套**（敘事 API.md＋手寫 openapi.yaml＋自動產生模組），CI 強制
   「路由表 × 規格」雙向相等 — 加端點不補文件直接紅燈。
+
+## 儲存模式：R2 是可選的
+
+聊天附件有**兩種模式，由 `wrangler.toml` 裡有沒有 `FILES` 這個 R2 綁定決定**。
+沒有旗標、也不需要 migration —— 把這個 repo 複製走、完全不開 R2，一樣跑得起來。
+
+| | 沒有 `FILES` 綁定 | 有 `FILES` 綁定 |
+|---|---|---|
+| 內容存哪 | D1 的 `pg_files.b64` | R2 物件，D1 只留中繼資料與鍵名 |
+| 單檔 | 1400KB | **5MB** |
+| 每人 | 30MB | 200MB |
+| 全站 | 300MB | 6144MB 原始大小（＝R2 裡的 8GB） |
+| 這個上限哪來的 | D1 單一值上限 2,000,000 bytes | Cloudflare R2 每月 10GB 免費額度 |
+
+兩個方向切換都是安全的，因為**每一列都自己記著內容在哪**（`pg_files.storage`）：
+開通 R2 不必搬資料、舊的 D1 檔照樣讀得到；關掉 R2 也不會讓頁面壞掉，
+那些檔會走既有的「檔案已刪除」佔位路徑。
+
+動這些數字之前有三件事要先知道：
+
+- **R2 存的是 base64 不是二進位**，這是刻意的。三家上游都只吃 base64，存二進位等於
+  每聊一輪就要重編一次（8.11ms/MB，而免費方案每請求只有 10ms CPU）。空間是一次性成本、
+  CPU 是每輪都要付的。那個 4/3 膨脹也是「8GB 的 R2 空間」被寫成 6144MB 配額的原因：
+  配額比對的是原始檔大小，R2 實際佔用是它的 1.334 倍。
+- **免費額度是用程式守的**，不是靠人盯儀表板（`src/lib/r2budget.ts`）：管理員能設定的配額
+  會被夾在硬天花板內，每日 cron 量真實用量（附件＋備份）再照「實際還剩多少」從最舊的回收，
+  每月 Class A／B 操作預算用完則各自降級 —— 寫入退回 D1、讀取走佔位。刪除在 R2 免費，不計數。
+- **存得下 5MB 不等於送得出 5MB。** 單次請求能送給上游的圖片總量仍然卡在
+  `PG_LIMITS.maxImgBytesTotal` 的 1.5MB —— 那是 **CPU** 的限制（ADR-0011）不是儲存的，
+  所以瀏覽器端仍然照「模型吃得下多少」壓縮，而不是照儲存上限。
+
+完整理由與背後的實測數字：[ADR-0013](./docs/adr/0013-r2-optional-attachments.md)。
 
 ## 開發／測試／部署
 

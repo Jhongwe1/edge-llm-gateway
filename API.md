@@ -233,6 +233,7 @@ curl -X POST https://uaip.cc.cd/api/admin/pages ^
 
 - 請求本體＝圖片**二進位**（不是表單、不是 base64），Content-Type 帶 `image/webp`、`image/jpeg`、`image/png` 或 `image/gif`。
 - 大小上限 **1.8MB**（D1 單值限 2MB）。走 API 上傳**不會自動壓縮**，請先自己縮好（建議最寬 1400–1600px、JPEG 品質 85 左右）；網頁後台上傳才有自動壓縮。
+  - ⚠ 這條**沒有**跟著 v2.4.0 的附件一起放寬到 5MB：文章圖片仍然是 D1 BLOB（ADR-0002），`/img/{id}` 帶一年 immutable 快取、也會進每日備份的排除清單，搬去 R2 是另一件事（[DEBT #1](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/DEBT.md)）。1.8MB 是 D1 的物理限制，不是隨手訂的數字。
 - 可選參數 `?w=寬&h=高`（記尺寸，後台顯示用）。
 - 回 `{ id, url, bytes, w, h }`，url 形如 `/img/9` — 填進文章 cover，或以 `![說明](/img/9)` 插進內文。
 
@@ -264,7 +265,9 @@ curl -X PUT https://uaip.cc.cd/api/admin/menu ^
 
 ### 網站設定：GET / PUT /api/admin/settings
 
-**GET**（2026-07-17，/settings 管理頁的數據源）回目前**存的**原況：`{ ok, brand, custom, contact_url, pg_open, pg_default_system, relay_meter, quota_relay_day, quota_pg_day, rl_per_min, demo_mode, demo_active, demo_channel, demo_models, demo_per_min, demo_per_ip_day, demo_global_day, demo_max_tokens, tg_chat_id, tg_token_set, tg_token_hint, tg_env_set, tg_active, defaults }` — 數字鍵沒設過回 `null`（不是內建預設值），內建預設放在 `defaults` 物件；`demo_mode` 是開關本身的儲存值、`demo_active` 才是真正生效與否（開關＋`demo_channel` 都要有）；Telegram bot token **絕不回明文**（只回 `tg_token_set` 與尾 4 碼 `tg_token_hint`）。
+**GET**（2026-07-17，/settings 管理頁的數據源）回目前**存的**原況：`{ ok, brand, custom, contact_url, pg_open, pg_default_system, relay_meter, quota_relay_day, quota_pg_day, rl_per_min, demo_mode, demo_active, demo_channel, demo_models, demo_per_min, demo_per_ip_day, demo_global_day, demo_max_tokens, pgfile_max_kb, pgfile_user_mb, pgfile_total_mb, tg_chat_id, tg_token_set, tg_token_hint, tg_env_set, tg_active, defaults, storage }` — 數字鍵沒設過回 `null`（不是內建預設值），內建預設放在 `defaults` 物件；`demo_mode` 是開關本身的儲存值、`demo_active` 才是真正生效與否（開關＋`demo_channel` 都要有）；Telegram bot token **絕不回明文**（只回 `tg_token_set` 與尾 4 碼 `tg_token_hint`）。
+
+`storage`（2026-07-30 v2.4.0）回附件儲存的現況：`{ mode, ceiling, free, plan, ops }` — `mode` 是 `d1` 或 `r2`（由有沒有綁 R2 決定，不是設定值）、`ceiling` 是這個模式下三個 `pgfile_*` 各自能填到多大、`free` 是 Cloudflare R2 免費額度的原始數字、`plan` 是我們自訂的預算（永遠訂在免費額度以下）、`ops` 是本月 R2 操作用量（只有 `r2` 模式才有，`null` 表示純 D1）。
 
 **PUT：本體帶哪個鍵就改哪個鍵，沒帶的不動**（2026-07-14 起；跟文章／選單的整包覆蓋不同）。回 `{ ok, brand, custom, contact_url, pg_open, pg_default_system, quota_relay_day, quota_pg_day, rl_per_min, relay_meter, demo_* }`（改完的現況；配額鍵沒設過時顯示內建預設）。
 
@@ -290,6 +293,9 @@ curl -X PUT https://uaip.cc.cd/api/admin/menu ^
 | `dumb_mode` | `true`／`false` — **Dumb mode**（2026-07-22 v2.2）：把所有會員鎖在單一「隱藏」模型。開啟且 `dumb_channel`＋`dumb_model` 都設好才生效（GET 回 `dumb_active` 表示實際生效與否）。生效時非管理員會員：`/api/playground/models` 只回 `{ rows:[], dumb:true }`、聊天請求的 channel/model 一律被伺服器蓋成指定值、對話列表與內頁的 channel/model 遮空 — 會員不知道也改不了正在用什麼模型。**體驗模式也會跟著隱藏模型選單**，但訪客實際跑的仍是 `demo_channel`＋`demo_models` 第一個（成本上限不被蓋掉，見 §5f）。**管理員不受限**；不影響 API 中轉。網頁在 /settings 的「Playground」卡 |
 | `dumb_channel` | Dumb mode 鎖定的渠道 slug（空字串＝刪鍵＝不生效） |
 | `dumb_model` | Dumb mode 鎖定的模型名（要在該渠道的模型清單裡；空字串＝刪鍵） |
+| `pgfile_max_kb` | **Playground 附件單檔上限**（KB，正整數；`null`＝回到該模式的內建預設）。上限與預設跟著儲存模式走 — 純 D1 預設 1400／最多 1464，R2 預設 5120／最多 10240。超過天花板回 400 並附 `ceiling` |
+| `pgfile_user_mb` | 附件的**每人**總量上限（MB）；純 D1 預設 30／最多 300，R2 預設 200／最多 2048 |
+| `pgfile_total_mb` | 附件的**全站**總量上限（MB，比對的是原始檔大小）；純 D1 預設 300／最多 400，R2 預設 6144／最多 6144（＝R2 裡的 8GB）。超過由每日 cron 從最舊的開始清內容 |
 | `vpn_public` | `true`／`false` — **VPN 對外展示**（2026-07-22 v2.2）：開啟後側邊欄選單與 /vpn 頁對**所有訪客**可見（未批准者看到登入／等待批准閘門；訂閱本身仍要逐人批准 vpn 服務）。`false`（預設）＝維持 VPN 隱形：選單不渲染、/vpn 裝成不存在。網頁在 /settings 的「VPN」卡 |
 
 ```bat
@@ -513,10 +519,20 @@ Authorization: Bearer uak-你的金鑰
 
 單一文件抽出來的文字上限 40,000 字，超過截斷並在結尾標明（悄悄砍掉會讓模型以為自己讀完了）。
 
-- `POST /api/playground/files?mime=image/webp&name=a.webp&w=800&h=600` → `{ id, mime, name, bytes, w, h }`
+- `POST /api/playground/files?mime=image/webp&name=a.webp&w=800&h=600` → `{ id, mime, name, bytes, w, h, store }`
   - **本體直接是 base64 字串**（`Content-Type: text/plain`），不是 JSON、也不是二進位。這是為了 CPU：三家上游都只吃 base64，收二進位的話每次對話都要 `btoa` 編一次（1MB 圖 8.11ms，而免費方案每請求只有 10ms），包成 JSON 則是 `JSON.parse` 要逐字元掃過整段 base64（比 raw 慢 4.7 倍）。收 base64 原字串等於「瀏覽器編好、伺服器原封轉手」，全程不編不解。
   - 只收 **jpeg / png / webp / gif**。**宣告的 `mime` 必須與實際檔頭相符**（只解前 24 個字元驗魔術位元組），不符回 415 `type-mismatch`。svg 永遠不收（可執行的 XML）。
-  - 三層容量限制：單檔 `pgfile_max_kb`（預設 1400KB — D1 單值 2,000,000 bytes 反推 base64 膨脹後的天花板）、每人 `pgfile_user_mb`（預設 30MB）、全站 `pgfile_total_mb`（預設 300MB，超過由每日 cron 從**最舊**的開始清內容）。前兩層超過回 413。
+  - 回應的 `store` 是這個檔實際存在哪（`d1` 或 `r2`）。
+  - 三層容量限制，**預設值與可設定的上限都跟著儲存模式走**（有沒有綁 R2，見 [ADR-0013](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/docs/adr/0013-r2-optional-attachments.md)）：
+
+    | 設定鍵 | 純 D1 模式（預設／天花板） | R2 模式（預設／天花板） |
+    |---|---|---|
+    | `pgfile_max_kb` 單檔 | 1400 ／ 1464 | 5120 ／ 10240 |
+    | `pgfile_user_mb` 每人 | 30 ／ 300 | 200 ／ 2048 |
+    | `pgfile_total_mb` 全站 | 300 ／ 400 | 6144 ／ 6144 |
+
+    D1 那組的來源是 D1 單值上限 2,000,000 bytes（base64 膨脹 4/3 反推）與免費庫 500MB；R2 那組的來源是 Cloudflare R2 每月 10GB 免費額度 —— 6144MB 是「R2 裡的 8GB」換算成原始檔大小的結果（R2 存 base64，實佔是原始大小的 4/3）。**天花板是程式寫死的，`PUT /api/admin/settings` 只能往下調**，超過回 400 並附 `ceiling`。單檔／每人超過回 413，全站超過則由每日 cron 從**最舊**的開始清內容。
+  - R2 模式下若當月 R2 寫入操作額度用完，新檔會**自動退回存進 D1**（單檔上限跟著縮回 1400KB），而不是拒收；提示訊息會說明原因。
   - 剛上傳的檔案是**孤兒**（還沒綁對話），要等 `chat` 帶著它的編號送出才綁定；一直沒送出的**24 小時後由 cron 清掉**。
   - 體驗模式（未登入）也能上傳，吃同一套 demo 限流；全體匿名訪客共用 `demo:public` 這一個帳號的容量配額。
 - `GET /api/playground/files/{id}` → 圖片二進位（翻歷史對話時用）。只能讀自己的；**體驗模式上傳的只有管理員讀得到**（那些檔案全掛在 `demo:public` 名下，開放匿名讀取的話訪客只要把編號加一就能翻別人的）。內容已被清除回 **410 `purged`**（附 `name`/`bytes` 讓前端畫佔位）。

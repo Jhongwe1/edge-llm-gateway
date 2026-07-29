@@ -253,7 +253,8 @@ npx wrangler d1 export ipua-logs --remote --output backup.sql
 ### 自動備份與告警（v2.0.0 Phase I）
 
 - **自動備份**：每日 UTC 19:17（台北 03:17）cron 把全部資料表匯成 JSONL 存進 R2 桶
-  `uaip-backups`（物件 `backup/<UTC日>.jsonl`，圖片 BLOB 排除、保留最近 14 份）。
+  `uaip-backups`（物件 `backup/<UTC日>.jsonl`，圖片 BLOB 排除、保留最近 14 份
+  **且合計不超過 1536MB** — 資料庫變大時會從最舊的開始砍，不讓備份把附件的空間吃掉）。
   上面的手動 `d1 export` 仍然可用，當第二保險。
 - **Telegram 告警**：每 5 分鐘掃 errlog 增量推 Telegram。要啟用先跟 @BotFather 建 bot
   拿 token、跟 bot 說句話後打 `https://api.telegram.org/bot<token>/getUpdates` 拿 chat id。
@@ -266,8 +267,42 @@ npx wrangler d1 export ipua-logs --remote --output backup.sql
      printf '%s' '<chat id>'   | npx wrangler secret put TG_CHAT_ID
      ```
 - **健康紀錄**：每個 cron job 的最近一次結果寫在 settings 表 `cron_last_rollup` /
-  `cron_last_backup` / `cron_last_purge` / `cron_last_alerts`（JSON：ts、ok、note/err）；
-  job 失敗也會寫一列 errlog（src=`cron.<job>`），告警自然涵蓋 cron 自身故障。
+  `cron_last_backup` / `cron_last_r2guard` / `cron_last_purge` / `cron_last_alerts`
+  （JSON：ts、ok、note/err）；job 失敗也會寫一列 errlog（src=`cron.<job>`），
+  告警自然涵蓋 cron 自身故障。
+
+### R2 儲存與免費額度（v2.4.0，2026-07-30）
+
+兩個桶，都在 `wrangler.toml` 綁定；**兩個都是可選的**，拿掉綁定站台照跑（見 ADR-0013）：
+
+```
+uaip-backups  → binding BACKUPS：每日全庫 JSONL 備份
+uaip-files    → binding FILES   ：Playground 聊天附件（存 base64 字串）
+```
+
+重建桶（換帳號／重來一次）：
+
+```
+npx wrangler r2 bucket create uaip-backups
+npx wrangler r2 bucket create uaip-files
+```
+
+**免費額度是三條線**：儲存 10GB／月、Class A（寫入類）100 萬次／月、Class B（讀取類）
+1000 萬次／月。刪除免費。守門全寫在 `src/lib/r2budget.ts`，管理員**不需要**手動盯：
+
+- 空間規劃：附件 8192MB ＋ 備份 1536MB ＋ 安全邊際 512MB ＝ 剛好 10240MB。
+  附件那 8GB 換算成配額數字是 `pgfile_total_mb = 6144` —— R2 存的是 base64，
+  實佔是原始檔大小的 4/3，**這道換算不做就會實佔 10.9GB 而完全沒有錯誤訊息**。
+- 每日 `r2guard` job 量真實用量（附件 SUM×4/3 ＋ 備份物件實際大小）寫進
+  `cron_last_r2guard`；任何一條線用到 80% 就寫 errlog → 五分鐘後 Telegram 告警。
+- 當月操作計數在 settings 的 `r2a_<年-月>` / `r2b_<年-月>`（舊月份由 r2guard 自動清）。
+  Class A 用完 → 新附件自動改存 D1（單檔上限跟著縮回 1400KB），不是拒收；
+  Class B 用完 → 回讀舊圖走「檔案已刪除」佔位。兩種都會自己恢復（換月歸零）。
+- `pgfile_max_kb` / `pgfile_user_mb` / `pgfile_total_mb` 可在 `PUT /api/admin/settings` 調，
+  但**只能往下**：超過程式寫死的天花板回 400 並附 `ceiling`。想知道現況打
+  `GET /api/admin/settings`，看 `storage` 那一塊（模式、天花板、本月用量）。
+
+查用量：`npx wrangler r2 bucket info uaip-files`（或 Dashboard → R2）。
 
 ## 本機測試
 

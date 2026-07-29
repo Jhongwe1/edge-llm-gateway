@@ -9,7 +9,7 @@
 //   3. 管理員／agent 可用 Authorization: Bearer <LOGS_TOKEN> 直接測（身分算管理員帳號）。
 import { json } from "./site.js";
 import { getSessionUser, goodOrigin, canUsePlayground, adminEmails, isDevEnv, tokenEqual } from "./auth.js";
-import { getB64 } from "./filestore.js";
+import { getB64, countR2Reads } from "./filestore.js";
 import type { FileRow } from "./filestore.js";
 import type { ChannelRow, Env, UserRow } from "../types.js";
 
@@ -376,6 +376,15 @@ export async function loadImages(
       }
       if (imgs.length) w.m.images = imgs;
     })
+  );
+  // 這一輪一共讀了幾個 R2 物件（＝幾次 Class B），一次記完。
+  // 這裡沒有 ctx 可以丟 waitUntil，但成本是「整個請求 1 次 D1 寫入」而不是每張圖一次，
+  // 而且這條路上本來就要寫 req_log —— 多這一筆不會改變成本量級。
+  await countR2Reads(
+    env,
+    want.reduce(function (acc: FileRow[], w) {
+      return acc.concat(w.rows);
+    }, [])
   );
   return {};
 }

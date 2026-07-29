@@ -8,6 +8,8 @@
 import { html, pageShell, assetSrc } from "./site.js";
 import { getChromeFor } from "./chrome.js";
 import { MEMBER_CSS, MEMBER_JS } from "./memberui.js";
+import { PG_LIMITS } from "./playground.js";
+import { uploadPlan } from "./filestore.js";
 import type { Env } from "../types.js";
 
 const PG_CSS = `
@@ -185,7 +187,20 @@ const PG_CSS = `
 
 export async function playgroundPageResponse(env: Env, request: Request): Promise<Response> {
   const { chrome } = await getChromeFor(env, request); // 選單依身分過濾（VPN 隱形）
+
+  // 前端壓縮圖片時要壓到多小 —— 兩條線取小的那條：
+  //   1. 伺服器這次收得下多大（純 D1 1400KB／R2 5MB；R2 寫入額度用完會自動退回 D1 那條）
+  //   2. 單次對話能送給上游多少圖（PG_LIMITS.maxImgBytesTotal，1.5MB）
+  // 第 2 條是**CPU** 換算出來的，換到 R2 也不會變。少了它的話會出現最難解釋的那種壞法：
+  // 圖傳得上去、縮圖也看得到，但模型永遠說「我沒看到圖」—— 因為它在組上游 body 之前
+  // 就被降級成文字佔位了（見 loadImages）。壓縮目標壓在模型吃得下的線內，才不會發生。
+  const plan = await uploadPlan(env);
+  const compressTo = Math.min(plan.maxKb * 1024, PG_LIMITS.maxImgBytesTotal);
+
   const body =
+    "<script data-nonce>window.__PGFILE=" +
+    JSON.stringify({ max: compressTo, store: plan.store }) +
+    ";</script>\n" +
     '<div id="root"><div class="gate"><div class="spin"></div></div></div>\n' +
     '<script data-nonce src="' +
     assetSrc("marked.js") +
@@ -627,7 +642,9 @@ const PG_JS = `
     /* 拖放與貼上也走這裡。跟 ＋ 按鈕擋在同一道門後面 —— 否則就會變成
        「按鈕擋得住、把檔案拖進來卻可以」的隱藏後門，那種不一致最難跟使用者解釋。 */
     if(attachBlocked())return;
-    var maxBytes=1400*1024;   /* 跟伺服器 FILE_DEFAULTS.pgfile_max_kb 一致（超過那邊也會擋） */
+    /* 伺服器算好的壓縮目標（window.__PGFILE，見 playgroundPageResponse）。
+       取不到就退回 1400KB —— 那是純 D1 模式的上限，任何模式下都收得進去。 */
+    var maxBytes=(window.__PGFILE&&window.__PGFILE.max)||1400*1024;
     files.forEach(function(f){
       if(atts.length>=8){MU.flash(tx("一次最多 8 個附件","Up to 8 attachments at a time"));return;}
       if(PGA.isImage(f)){

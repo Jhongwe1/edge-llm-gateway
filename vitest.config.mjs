@@ -26,7 +26,11 @@ export default defineWorkersConfig(async () => {
           miniflare: {
             compatibilityDate: "2026-07-01",
             d1Databases: ["DB"],
-            r2Buckets: ["BACKUPS"], // Phase I 備份測試用（記憶體模擬）
+            // BACKUPS＝Phase I 備份測試用（記憶體模擬）。
+            // FILES_TEST 是**故意不叫 FILES** 的：附件的儲存模式看 env.FILES 在不在
+            //（lib/filestore.ts activeStore），真的綁成 FILES 的話全部測試都會變成 R2 模式，
+            // D1 模式就再也測不到了。要測 R2 的測試自己組 { ...env, FILES: env.FILES_TEST }。
+            r2Buckets: ["BACKUPS", "FILES_TEST"],
             durableObjects: {
               RATE_LIMITER: { className: "RateLimiter", useSQLite: true }
             },

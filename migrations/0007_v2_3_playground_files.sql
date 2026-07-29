@@ -18,7 +18,9 @@
 -- D1 單一值上限 2,000,000 bytes；base64 會膨脹成 ceil(n/3)*4，所以原始檔的天花板是
 -- 2,000,000 × 3/4 ≈ 1,464KB，預設取 1400KB 留餘裕（lib/filestore.ts FILE_DEFAULTS）。
 -- 前端一律先壓到長邊 1568px（各家 vision 的 tile 甜蜜點），一般照片壓完 200–400KB。
--- 存 R2 時不受這條限制（見 storage 欄位）。
+-- 存 R2 時不受這條限制（見 storage 欄位）：2026-07-30 v2.4.0 開通 R2 後，R2 模式的單檔
+-- 上限是 5MB（來源改成 Anthropic vision 每張圖的硬上限，不再是 D1 的 2MB 單值限制）。
+-- 兩種模式怎麼切、免費額度怎麼守，見 docs/adr/0013-r2-optional-attachments.md。
 CREATE TABLE IF NOT EXISTS pg_files (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL,           -- 上傳者＝配額歸屬（demo 訪客全掛 demo:public 那一列）
