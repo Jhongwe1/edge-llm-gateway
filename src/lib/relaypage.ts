@@ -243,7 +243,7 @@ const RELAY_JS = `
       box.innerHTML="";
       var rows=d.rows||[];
       if(!rows.length){box.appendChild(el("p","muted",tx("還沒有管道，按「＋ 新增」建立第一個。","No channels yet.")));return;}
-      rows.forEach(function(c){
+      rows.forEach(function(c,idx){
         var row=el("div","rowline");
         var g=el("div","g");
         var t1=el("div","t1");
@@ -258,16 +258,22 @@ const RELAY_JS = `
           ?tx("模型：","models: ")+c.models.join(", ")
           :tx("⚠ 還沒設定模型名稱（編輯補上）","⚠ no models yet");
         g.appendChild(t3);row.appendChild(g);
+        /* 排序：↑↓ 交換相鄰兩個管道的位置。
+           決定 Playground 模型選單裡「管道之間」的先後；管道**之內**的模型順序
+           照編輯視窗那份清單的行序（把想排前面的模型移到第一行即可）。 */
+        var up=el("button","btn","\\u2191");
+        up.title=tx("往上移（模型選單的順序）","Move up (order in the model menu)");
+        up.disabled=idx===0;
+        up.addEventListener("click",function(){moveChannel(rows,idx,-1,box);});
+        var dn=el("button","btn","\\u2193");
+        dn.title=tx("往下移","Move down");
+        dn.disabled=idx===rows.length-1;
+        dn.addEventListener("click",function(){moveChannel(rows,idx,1,box);});
         var tg=el("button","btn",c.enabled?tx("停用","Disable"):tx("啟用","Enable"));
         tg.addEventListener("click",function(){
           tg.disabled=true;
-          /* ⚠ 這個 PUT 一定要帶「完整」欄位。cleanChannel 對沒帶的選填欄位一律當成空字串
-             寫回去（PUT＝整包覆蓋，不是 PATCH），所以少帶一欄就是把那欄的資料洗掉。
-             2026-07-29 發現的既有 bug：這裡原本只帶 6 欄，於是按一下「停用」再「啟用」，
-             該管道的系統提示詞與額外請求參數就無聲消失了 —— 而管理員完全不會發現，
-             要等到某個會員發現人設不見、或 Venice 那類渠道又開始洩漏身分才查得出來。
-             以後新增管道欄位時，這一行要跟著加。 */
-          api("/api/admin/relay/channels/"+c.id,{method:"PUT",json:{name:c.name,slug:c.slug,kind:c.kind,base_url:c.base_url,models:c.models,system_prompt:c.system_prompt,extra_body:c.extra_body,vision_models:c.vision_models,enabled:!c.enabled}})
+          var p=chPayload(c);p.enabled=!c.enabled;
+          api("/api/admin/relay/channels/"+c.id,{method:"PUT",json:p})
             .then(function(){reloadAdmin(box);MU.flash(c.enabled?tx("已停用","Disabled"):tx("已啟用","Enabled"));})
             .catch(function(e){tg.disabled=false;MU.flash(esc(e.message||e));});
         });
@@ -277,10 +283,41 @@ const RELAY_JS = `
           if(!confirm(tx("刪除管道「"+c.name+"」？","Delete channel?")))return;
           api("/api/admin/relay/channels/"+c.id,{method:"DELETE"}).then(function(){reloadAdmin(box);MU.flash(tx("已刪除","Deleted"));}).catch(function(e){MU.flash(esc(e.message||e));});
         });
+        row.appendChild(up);row.appendChild(dn);
         row.appendChild(tg);row.appendChild(ed);row.appendChild(del);
         box.appendChild(row);
       });
     }).catch(function(e){box.innerHTML='<p class="muted">'+esc(e.message||e)+'</p>';});
+  }
+
+  /* 管道的完整欄位包。
+     ⚠ 任何 PUT 都一定要帶「完整」欄位：cleanChannel 對沒帶的選填欄位一律當成空字串寫回去
+     （PUT＝整包覆蓋，不是 PATCH），少帶一欄就是把那欄的資料洗掉。
+     2026-07-29 就踩過這個 bug —— 停用/啟用鈕原本只帶 6 欄，按一下停用再啟用，
+     該管道的系統提示詞與額外請求參數就無聲消失，而管理員完全不會發現。
+     抽成這個函式就是為了不要再有第二個地方漏帶；**以後新增管道欄位，改這裡一處就好**。 */
+  function chPayload(c){
+    return {name:c.name,slug:c.slug,kind:c.kind,base_url:c.base_url,models:c.models,
+            system_prompt:c.system_prompt,extra_body:c.extra_body,vision_models:c.vision_models,
+            sort_order:c.sort_order,enabled:!!c.enabled};
+  }
+
+  /* 上移／下移：交換位置後把**整份清單**重新編號送出。
+     只 PUT 被交換的那兩個會有個坑 —— 初始狀態所有 sort_order 都是 0（照 id 排），
+     交換 0 和 0 等於什麼都沒發生。整份重編號就不必處理這種特例，
+     而管道數量本來就只有個位數，多幾個請求無所謂。 */
+  function moveChannel(rows,idx,dir,box){
+    var j=idx+dir;
+    if(j<0||j>=rows.length)return;
+    var arr=rows.slice();
+    var t=arr[idx];arr[idx]=arr[j];arr[j]=t;
+    Promise.all(arr.map(function(c,i){
+      var p=chPayload(c);p.sort_order=(i+1)*10;   /* 留間隔，之後要插隊也不必全部重算 */
+      return api("/api/admin/relay/channels/"+c.id,{method:"PUT",json:p});
+    })).then(function(){
+      reloadAdmin(box);
+      MU.flash(tx("順序已更新","Order updated"));
+    }).catch(function(e){MU.flash(esc(e.message||e));});
   }
   function editChannel(c,box){
     var isNew=!c;c=c||{kind:"openai",enabled:1};

@@ -394,6 +394,7 @@ curl -X PUT https://uaip.cc.cd/api/admin/prices ^
 | `api_key` | 上游金鑰（只有管理員 API 摸得到，回讀一律遮罩） |
 | `models` | **必填** 這個管道可用的模型名稱（陣列，或逗號／換行分隔的字串；限英數與 `. _ / : -`、上限 40 個）。會員頁與 Playground 都靠這份清單 |
 | `system_prompt` | **選填** 這個管道在 **Playground** 的系統提示詞（上限 8000 字，超過回 400、不截斷）。**留空＝套用站台預設**（`PUT /api/admin/settings` 的 `pg_default_system`，沒設過就是程式內建的 `PG_DEFAULT_SYSTEM`；管理員視窗那格的灰字顯示的就是當下實際會套的那段）；填了就**整段取代**預設。要一次改掉全部渠道的人設就改站台預設，不必逐個渠道填。**只作用在 `/playground`**：`/relay` API 中轉是透明代理，一律不注入任何提示詞 — 會員自己送什麼就轉什麼 |
+| `sort_order` | **選填**（2026-07-29 v2.3）整數，決定 **Playground 模型選單裡「管道之間」的先後**（小的在前；同分退回 id，所以舊資料順序不變）。管道**之內**的模型順序照 `models` 的行序 —— 想調哪個模型排前面，把它移到清單第一行即可。**沒帶＝維持原值**（跟 `api_key` 同一套 undefined 語意，普通的欄位編輯不會把排序洗掉）。網頁上在 /relay 管道列表用 ↑↓ 調整 |
 | `vision_models` | **選填**（2026-07-29 v2.3）這個管道裡**看得懂圖片**的模型（陣列或換行/逗號分隔字串），**必須是 `models` 的子集**（填了沒開放的模型回 400）。**留空＝這個管道不支援附圖**——各家都沒有查詢模型能力的端點、名字也看不出來，所以一律預設不支援，管理員明確填了才開放。會員在 /playground 的附件鈕會依這份清單決定能不能點 |
 | `extra_body` | **選填** 合併進 **Playground** 上游請求本體的額外參數，必須是 **JSON 物件字串**（上限 4000 字；存檔當下就驗，不合法回 400）。**留空＝不合併任何東西**（注意：跟 `system_prompt` 的「留空＝套預設」相反，網頁上那格的灰字只是範例）。用來處理各家專屬參數，例 `{"venice_parameters":{"include_venice_system_prompt":false}}`、OpenAI 的 `reasoning_effort`、Anthropic 的 `thinking`。`model`／`stream`／`messages`／`contents` 擋著**不給覆寫**。**只作用在 `/playground`**，`/relay` 中轉不注入 |
 | `enabled` | 預設 true |

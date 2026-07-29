@@ -62,6 +62,9 @@ export interface RelayChannelInput {
   system_prompt: string;
   extra_body: string;
   vision_models: string;
+  // 沒帶＝維持原值（跟 api_key 同一套 undefined 語意）。排序是「列表操作」的產物，
+  // 不該被一次普通的欄位編輯順手歸零。
+  sort_order?: number;
   enabled: number;
   api_key?: string;
 }
@@ -138,6 +141,10 @@ export function cleanChannel(b: any): CleanRelayChannelResult {
     ch.api_key = String(b.api_key == null ? "" : b.api_key)
       .trim()
       .slice(0, 500);
+  if (b.sort_order !== undefined) {
+    const n = parseInt(String(b.sort_order), 10);
+    ch.sort_order = Number.isFinite(n) ? n : 0;
+  }
   return { ch: ch };
 }
 
@@ -158,6 +165,7 @@ export function maskRow(r: any) {
         return s.trim();
       })
       .filter(Boolean),
+    sort_order: r.sort_order == null ? 0 : Number(r.sort_order),
     enabled: r.enabled,
     created_at: r.created_at,
     has_key: !!r.api_key,
@@ -170,7 +178,7 @@ export async function onRequestGet({ request, env }: RouteCtx): Promise<Response
   if (!(await adminOk(request, env, url))) return json({ error: "unauthorized" }, 401);
   if (!env.DB) return json({ error: "no-db" }, 500);
   try {
-    const res = await env.DB.prepare("SELECT * FROM relay_channels ORDER BY id").all();
+    const res = await env.DB.prepare("SELECT * FROM relay_channels ORDER BY sort_order, id").all();
     return json({ rows: (res.results || []).map(maskRow) });
   } catch (e: any) {
     return json({ error: "query-failed", detail: String((e && e.message) || e) }, 500);
@@ -196,7 +204,7 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const r = await env.DB.prepare(
-        "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,system_prompt,extra_body,vision_models,enabled,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
+        "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,system_prompt,extra_body,vision_models,sort_order,enabled,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
       )
         .bind(
           slug,
@@ -208,6 +216,7 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
           c.ch.system_prompt,
           c.ch.extra_body,
           c.ch.vision_models,
+          c.ch.sort_order == null ? 0 : c.ch.sort_order, // 新管道排在同分組最後（ORDER BY sort_order, id）
           c.ch.enabled,
           new Date().toISOString()
         )

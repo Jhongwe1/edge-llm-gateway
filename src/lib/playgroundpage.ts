@@ -100,6 +100,9 @@ const PG_CSS = `
   .pg-plus{width:36px;height:36px;flex:0 0 auto;border:0;background:none;color:var(--fg);border-radius:50%;
            font-size:18px;line-height:1;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;justify-content:center;transition:.15s}
   .pg-plus:hover{background:var(--hov)}
+  /* 目前模型看不了圖片：整顆鈕變灰。刻意不用 disabled —— 那樣按下去不會有任何反應，
+     使用者只會覺得功能壞了；留著可按才有機會解釋「換個模型就能傳圖」。 */
+  .pg-plus.off{color:var(--sub);opacity:.5}
   /* overflow-y 平常藏起來，長文超過 max-height 時才由 autoGrow 放出捲軸 */
   .pg-ta{flex:1;resize:none;border:0;background:none;color:var(--fg);
          padding:8px 6px;font-size:15px;font-family:inherit;line-height:1.55;outline:none;
@@ -360,6 +363,7 @@ const PG_JS = `
           model=x.v;
           try{localStorage.setItem("ipua-pg-model",model);}catch(e){}
           updateTitle();
+          updatePlus();   /* ＋ 鈕的灰／亮跟著新模型的視覺能力走 */
           /* 換到看不了圖的模型時，還掛著的圖片附件會在送出時被伺服器擋下來（400）。
              與其讓人打完字才發現，不如當下就清掉並講明原因。 */
           if(!seesImages()){
@@ -462,11 +466,11 @@ const PG_JS = `
     UI.atts.style.display="none";
     comp.appendChild(UI.atts);
     var row=el("div","pg-comp-row");
-    var plus=el("button","pg-plus");
-    plus.type="button";plus.textContent="\\uff0b";
-    plus.title=tx("附加檔案","Attach files");
-    plus.addEventListener("click",function(e){e.stopPropagation();attachMenu(plus);});
-    row.appendChild(plus);
+    UI.plus=el("button","pg-plus");
+    UI.plus.type="button";UI.plus.textContent="\\uff0b";
+    UI.plus.addEventListener("click",function(e){e.stopPropagation();attachClick();});
+    row.appendChild(UI.plus);
+    updatePlus();
     UI.ta=el("textarea","pg-ta");
     UI.ta.rows=1;
     UI.ta.placeholder=tx("詢問任何問題","Ask anything");
@@ -541,27 +545,34 @@ const PG_JS = `
     return false;
   }
 
-  function attachMenu(btn){
-    if(!window.SBPOP)return;
-    /* pgattach.js 沒載進來（網路壞了／被擋）→ 講清楚，不要讓按鈕按下去毫無反應 */
+  /* ＋ 按下去做什麼：直接開檔案選擇器，不插一層「上傳照片／上傳檔案」的選單 ——
+     多一次點擊只為了選類別，而檔案選擇器本來就分得出來。
+     模型看不了圖時按鈕會變灰（見 updatePlus），這裡再講一次原因並把可選型別縮到文件，
+     免得使用者在選擇器裡挑了圖片、按了確定，才被告知不能用。 */
+  function attachClick(){
     if(!window.PGA){MU.flash(tx("附件功能載入失敗，請重新整理","Attachment module failed to load — please refresh"));return;}
-    var canImg=seesImages();
-    window.SBPOP.open(btn,function(p){
-      var it=window.SBPOP.item(p,tx("上傳照片","Upload photo"),function(){
-        if(canImg)pickFiles(true);
-        else MU.flash(tx("目前的模型看不了圖片 — 請先在上方換一個支援視覺的模型","This model can't read images — pick a vision model above"));
-      });
-      /* 不支援時不把選項藏起來，而是留著並變灰：藏起來的話使用者只會覺得「功能壞了」，
-         留著才看得出「有這個功能，只是這個模型不行」。 */
-      if(!canImg){it.style.opacity=".45";it.title=tx("目前的模型看不了圖片","Current model can't read images");}
-      window.SBPOP.item(p,tx("上傳檔案","Upload file"),function(){pickFiles(false);});
-    });
+    if(!seesImages()){
+      MU.flash(tx("目前的模型看不了圖片 — 請換一個支援視覺的模型；文件（PDF／Word／Excel）不受影響",
+                  "This model can't read images — switch to a vision model; documents (PDF/Word/Excel) still work"));
+    }
+    pickFiles();
   }
 
-  function pickFiles(imageOnly){
+  /* ＋ 按鈕的狀態跟著「目前模型能不能看圖」走。用 class 不用 disabled：
+     disabled 的按鈕收不到 click，就沒辦法在按下去時解釋原因了。 */
+  function updatePlus(){
+    if(!UI.plus)return;
+    var ok=seesImages();
+    UI.plus.classList.toggle("off",!ok);
+    UI.plus.title=ok?tx("附加檔案","Attach files")
+      :tx("目前的模型看不了圖片（文件仍可上傳）","Current model can't read images (documents still work)");
+  }
+
+  function pickFiles(){
     var inp=document.createElement("input");
     inp.type="file";inp.multiple=true;
-    inp.accept=imageOnly?PGA.acceptImage:PGA.acceptDoc;
+    /* 看不了圖的模型就不要讓人選到圖片 —— 選了也只會被擋下來 */
+    inp.accept=seesImages()?(PGA.acceptImage+","+PGA.acceptDoc):PGA.acceptDoc;
     inp.style.display="none";
     inp.addEventListener("change",function(){
       var fs=Array.prototype.slice.call(inp.files||[]);
@@ -765,6 +776,9 @@ const PG_JS = `
       b.appendChild(det);
     });
     m.appendChild(b);
+    /* 自己說過的話也要能複製（跟 AI 回覆一樣）。複製的是「使用者實際打的字」——
+       不含附件被併進去的檔案內容，那動輒幾萬字，不會是他想貼到別處的東西。 */
+    if(parts.text)addActions(m,parts.text);
     UI.msgs.appendChild(m);scrollBottom();
     return m;
   }

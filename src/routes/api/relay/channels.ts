@@ -11,7 +11,7 @@ export async function onRequestGet({ request, env }: RouteCtx): Promise<Response
   if (!env.DB) return json({ error: "no-db" }, 500);
   try {
     const res = await env.DB.prepare(
-      "SELECT slug,name,kind,models FROM relay_channels WHERE enabled=1 ORDER BY id"
+      "SELECT slug,name,kind,models FROM relay_channels WHERE enabled=1 ORDER BY sort_order, id"
     ).all();
     const rows = (
       (res.results || []) as { slug: string; name: string; kind: string; models?: unknown }[]

@@ -3,6 +3,7 @@
 // 所以驗證錯誤不只是收到壞圖，而是整包請求的結構被破壞。
 import { describe, it, expect } from "vitest";
 import { sniffMime, b64Bytes, isB64, OK_IMAGE_MIME, FILE_DEFAULTS } from "../../src/lib/filestore.js";
+import { cleanChannel } from "../../src/routes/api/admin/relay/channels/index.js";
 
 // 各格式的真實檔頭（前幾個 byte）→ base64
 function headB64(bytes: number[]): string {
@@ -89,5 +90,42 @@ describe("配額預設值", () => {
   });
   it("全站上限留了餘裕給正職資料（D1 免費庫 500MB）", () => {
     expect(FILE_DEFAULTS.pgfile_total_mb).toBeLessThanOrEqual(300);
+  });
+});
+
+/* ===== 管道排序與視覺模型（v2.3 的 cleanChannel 語意）===== */
+
+describe("cleanChannel — sort_order 的 undefined 語意", () => {
+  const base = () => ({ name: "x", kind: "openai", base_url: "https://a.b", models: "m1\nm2" });
+
+  it("沒帶 sort_order → 欄位是 undefined（呼叫端據此保留舊值）", () => {
+    const r = cleanChannel(base());
+    expect(r.err).toBeUndefined();
+    expect(r.ch!.sort_order).toBeUndefined();
+  });
+  it("有帶就收進來（含 0）", () => {
+    expect(cleanChannel({ ...base(), sort_order: 30 }).ch!.sort_order).toBe(30);
+    expect(cleanChannel({ ...base(), sort_order: 0 }).ch!.sort_order).toBe(0);
+    expect(cleanChannel({ ...base(), sort_order: "20" }).ch!.sort_order).toBe(20);
+  });
+  it("垃圾值當 0，不讓它變 NaN 寫進 D1", () => {
+    expect(cleanChannel({ ...base(), sort_order: "abc" }).ch!.sort_order).toBe(0);
+  });
+});
+
+describe("cleanChannel — vision_models 必須是 models 的子集", () => {
+  const base = () => ({ name: "x", kind: "openai", base_url: "https://a.b", models: "m1\nm2" });
+
+  it("子集 → 通過，存成逗號分隔", () => {
+    const r = cleanChannel({ ...base(), vision_models: "m2" });
+    expect(r.err).toBeUndefined();
+    expect(r.ch!.vision_models).toBe("m2");
+  });
+  it("填了不在清單裡的模型 → 擋下來並指名是哪個（多半是打錯字）", () => {
+    const r = cleanChannel({ ...base(), vision_models: "m3" });
+    expect(r.err).toContain("m3");
+  });
+  it("留空＝這個管道不支援附圖（安全預設）", () => {
+    expect(cleanChannel(base()).ch!.vision_models).toBe("");
   });
 });

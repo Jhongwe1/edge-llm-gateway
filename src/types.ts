@@ -72,6 +72,7 @@ export interface ChannelRow {
   system_prompt: string; // 只給 Playground 注入的系統提示詞；/relay 中轉不讀這欄（migration 0005）
   extra_body: string; // 合併進 playground 上游請求本體的額外參數（JSON 物件字串）；/relay 不讀（migration 0006）
   vision_models: string; // 這個管道裡「吃得下圖片」的模型（逗號分隔）；空＝都不支援（migration 0007）
+  sort_order: number; // Playground 模型選單裡的管道先後（小的在前；同分退回 id，migration 0008）
   enabled: number;
   created_at: string;
   [key: string]: unknown;

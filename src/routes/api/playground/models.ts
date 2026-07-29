@@ -82,7 +82,7 @@ export async function onRequestGet({ request, env }: RouteCtx): Promise<Response
   }
   try {
     const res = await env.DB.prepare(
-      "SELECT slug,name,models,vision_models FROM relay_channels WHERE enabled=1 ORDER BY id"
+      "SELECT slug,name,models,vision_models FROM relay_channels WHERE enabled=1 ORDER BY sort_order, id"
     ).all();
     // 不回 kind：kind 等於標示真實提供商（openai/anthropic/gemini），Playground 前端也用不到
     const rows = (

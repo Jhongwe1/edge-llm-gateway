@@ -29,12 +29,13 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
   try {
     const old = await env.DB.prepare("SELECT * FROM relay_channels WHERE id=?1")
       .bind(id)
-      .first<{ api_key: string; slug: string }>();
+      .first<{ api_key: string; slug: string; sort_order?: number }>();
     if (!old) return json({ error: "not-found" }, 404);
     const key = c.ch.api_key === undefined ? old.api_key : c.ch.api_key;
+    const sortOld = old.sort_order == null ? 0 : Number(old.sort_order);
     const slug = c.ch.slug || old.slug; // 沒帶 slug＝沿用舊代稱（會員的 /relay 網址不變）
     await env.DB.prepare(
-      "UPDATE relay_channels SET slug=?1,name=?2,kind=?3,base_url=?4,api_key=?5,models=?6,system_prompt=?7,extra_body=?8,vision_models=?9,enabled=?10 WHERE id=?11"
+      "UPDATE relay_channels SET slug=?1,name=?2,kind=?3,base_url=?4,api_key=?5,models=?6,system_prompt=?7,extra_body=?8,vision_models=?9,sort_order=?10,enabled=?11 WHERE id=?12"
     )
       .bind(
         slug,
@@ -46,6 +47,8 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
         c.ch.system_prompt,
         c.ch.extra_body,
         c.ch.vision_models,
+        // 沒帶 sort_order＝維持原本的排序（普通的欄位編輯不該把管道位置洗掉）
+        c.ch.sort_order === undefined ? sortOld : c.ch.sort_order,
         c.ch.enabled,
         id
       )
