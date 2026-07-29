@@ -6,7 +6,8 @@
 import { json, SLUG_RE } from "../../../../../lib/site.js";
 import { adminOk, keyHint, randToken } from "../../../../../lib/auth.js";
 import { audit } from "../../../../../lib/observe.js";
-import type { RouteCtx } from "../../../../../types.js";
+import { refreshChannelCaps } from "../../../../../lib/modelcaps.js";
+import type { ChannelRow, RouteCtx } from "../../../../../types.js";
 
 export const KINDS: Record<string, number> = { openai: 1, anthropic: 1, gemini: 1, custom: 1 };
 
@@ -231,6 +232,17 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
         "relay.channel.create",
         slug,
         c.ch.name + " kind=" + c.ch.kind + " base=" + c.ch.base_url + " 金鑰:" + (c.ch.api_key ? "有" : "無")
+      );
+      // 新管道也順手問一次上游的模型能力（單次吃幾張圖，migration 0009）——
+      // 不必等隔天的 cron。背景跑，問不到就維持空快取＝套內建預設值。
+      context.waitUntil(
+        refreshChannelCaps(env, {
+          id: r.meta.last_row_id,
+          kind: c.ch.kind,
+          base_url: c.ch.base_url,
+          api_key: c.ch.api_key || "",
+          models: c.ch.models
+        } as unknown as ChannelRow)
       );
       return json({ id: r.meta.last_row_id, slug: slug, url: "/relay/" + slug });
     } catch (e: any) {

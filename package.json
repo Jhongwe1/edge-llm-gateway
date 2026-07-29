@@ -1,6 +1,6 @@
 {
   "name": "edge-llm-gateway",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "private": true,
   "type": "module",
   "description": "Full-stack LLM gateway on a single Cloudflare Worker — atomic quotas, per-request cost metering, 10 ms-CPU-safe streaming, plus a ChatGPT-style playground, CMS, VPN subscriptions and an IP / User-Agent / browser-fingerprint tool. Zero framework, zero runtime deps, D1 only.",

@@ -162,13 +162,14 @@ export async function seedChannel(over?: Partial<ChannelRow>): Promise<ChannelRo
       api_key: "sk-upstream-secret",
       models: "test-model",
       vision_models: "", // v2.3：空＝這個渠道的模型都看不了圖（安全預設，與正式行為一致）
+      model_caps: "", // v2.4.1：空＝還沒問過上游的能力，一律套內建預設（migration 0009）
       enabled: 1
     },
     over || {}
   );
   const r = await testEnv.DB.prepare(
-    "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,vision_models,enabled,created_at) " +
-      "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+    "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,vision_models,model_caps,enabled,created_at) " +
+      "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
   )
     .bind(
       o.slug,
@@ -178,6 +179,7 @@ export async function seedChannel(over?: Partial<ChannelRow>): Promise<ChannelRo
       o.api_key,
       o.models,
       o.vision_models,
+      o.model_caps,
       o.enabled,
       new Date().toISOString()
     )

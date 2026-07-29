@@ -12,6 +12,7 @@ import { reportErrorNow } from "./lib/observe.js";
 import { deleteFiles, evictOldest, fileLimits } from "./lib/filestore.js";
 import type { FileRow } from "./lib/filestore.js";
 import { R2_FREE, R2_PLAN, bumpOps, filesRawMbBudget, opKeys, r2MbFromRawMb, r2Ops } from "./lib/r2budget.js";
+import { refreshAllCaps } from "./lib/modelcaps.js";
 import type { Env, Row } from "./types.js";
 
 export const CRON_ALERTS = "*/5 * * * *";
@@ -397,6 +398,9 @@ export async function runCron(cron: string, env: Env, now?: Date): Promise<void>
     // r2guard 才算得出附件還剩多少額度，purge 最後照那個額度回收。
     await runJob(env, "r2guard", () => r2Guard(env));
     await runJob(env, "purge", () => purgeOld(env, now));
+    // 上游模型能力（單次吃幾張圖）：跟其他 job 無關，排最後。問不到就沿用舊快取，
+    // 所以上游掛掉的那天不會把已知的限制洗掉（見 lib/modelcaps.ts 檔頭第 2 點）。
+    await runJob(env, "modelcaps", () => refreshAllCaps(env));
   }
   if (isAlerts || all) {
     await runJob(env, "alerts", () => tgAlertScan(env));

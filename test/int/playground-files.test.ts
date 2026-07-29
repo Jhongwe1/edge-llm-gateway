@@ -273,6 +273,126 @@ describe("聊天串接", () => {
     expect(row.msg_id).toBeGreaterThan(0);
   });
 
+  // ── 上游模型能力（v2.4.1，migration 0009）──────────────────────────
+  // 2026-07-30 線上事故：會員一次丟 4 張圖問問題，上游回
+  //   {"error":"At most 1 image(s) may be provided in one prompt. (parameter=image)"}
+  // 站上當時寫死「單則 4 張」，跟模型實際吃幾張無關。這幾條就是那個洞的迴歸測試。
+  async function upload3(u: UserRow): Promise<number[]> {
+    const ids: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const up = await upCtx(u, fakeWebp(300));
+      ids.push(((await (await uploadFile(up)).json()) as any).id);
+      await drainWaits(up);
+    }
+    return ids;
+  }
+  function interceptOnce(grab: (b: string) => void) {
+    fetchMock
+      .get(UP)
+      .intercept({ path: "/v1/chat/completions", method: "POST" })
+      .reply(
+        200,
+        (opts: any) => {
+          grab(String(opts.body || ""));
+          return 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n';
+        },
+        { headers: { "content-type": "text/event-stream" } }
+      );
+  }
+
+  it("上游說這個模型只吃 1 張 → 只送 1 張出去，其餘降級成文字佔位（不是回錯誤）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "m1",
+      base_url: UP,
+      model_caps: '{"m1":1}'
+    });
+    const ids = await upload3(u);
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "比較這幾張", files: ids }]
+    });
+    const r = await chat(ctx);
+    await readAll(r);
+    await drainWaits(ctx);
+
+    // 真正送出去的就是 1 張 —— 多一張就是上游那發 400
+    expect(sent.split("data:image/webp;base64,").length - 1).toBe(1);
+    // 被砍掉的有講出來，模型知道這裡本來還有圖（使用者從對話也看得到）
+    expect(sent).toContain("已省略的圖片");
+  });
+
+  it("上游沒回報能力時照舊吃站上的預設張數（改動前的行為不變）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({ models: "m1", vision_models: "m1", base_url: UP, model_caps: "" });
+    const ids = await upload3(u);
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "看圖", files: ids }]
+    });
+    await readAll(await chat(ctx));
+    await drainWaits(ctx);
+    expect(sent.split("data:image/webp;base64,").length - 1).toBe(3);
+  });
+
+  it("上游說看得了圖 → 管理員沒填 vision_models 也放行（不必再人工維護清單）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "", // 刻意留空
+      base_url: UP,
+      model_caps: '{"m1":10}'
+    });
+    const up = await upCtx(u, fakeWebp(300));
+    const fid = ((await (await uploadFile(up)).json()) as any).id;
+    await drainWaits(up);
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "這是什麼", files: [fid] }]
+    });
+    const r = await chat(ctx);
+    await readAll(r);
+    await drainWaits(ctx);
+    expect(r.status).toBe(200);
+    expect(sent).toContain("data:image/webp;base64,");
+  });
+
+  it("上游說看不了圖 → 就算 vision_models 填了也擋（過期的人工清單不能蓋過上游）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "m1", // 管理員填了，但上游說這個模型沒有視覺
+      base_url: UP,
+      model_caps: '{"m1":0}'
+    });
+    const up = await upCtx(u, fakeWebp(300));
+    const fid = ((await (await uploadFile(up)).json()) as any).id;
+    await drainWaits(up);
+
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "看圖", files: [fid] }]
+    });
+    const r = await chat(ctx);
+    await drainWaits(ctx);
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as any).error).toBe("no-vision");
+  });
+
   it("別人的檔案編號塞進來 → 查不到，靜默降級成文字佔位（不會洩漏內容）", async () => {
     const owner = await approved();
     const attacker = await approved();

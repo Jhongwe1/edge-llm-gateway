@@ -73,6 +73,7 @@ export interface ChannelRow {
   extra_body: string; // 合併進 playground 上游請求本體的額外參數（JSON 物件字串）；/relay 不讀（migration 0006）
   vision_models: string; // 這個管道裡「吃得下圖片」的模型（逗號分隔）；空＝都不支援（migration 0007）
   sort_order: number; // Playground 模型選單裡的管道先後（小的在前；同分退回 id，migration 0008）
+  model_caps: string; // 上游回報的模型能力快取，JSON「模型名→單次最多幾張圖」；空＝沒問到，套預設（migration 0009）
   enabled: number;
   created_at: string;
   [key: string]: unknown;

@@ -296,6 +296,10 @@ function takeImgs(m: ChatMsg, acc: ImgAcc): { im: ChatImage; ph: string }[] {
  *   3. 總量超過 maxImgBytesTotal → 從**最舊**的開始降級成文字佔位。
  *      預算是 CPU 上限反推的（見 PG_LIMITS），不是喜好問題；而最新的圖幾乎一定是
  *      使用者正在問的那張，所以要保最新、丟最舊。
+ *   4. 張數超過 maxImgs → 同樣從最舊的開始降級（v2.4.1）。
+ *      這條是上游的硬規定，不是我們的預算：有些模型單次只吃 1 張，多送直接 400
+ *      （2026-07-30 事故，見 lib/modelcaps.ts）。張數與 bytes 兩個預算各走各的，
+ *      誰先用完誰就開始砍 —— 共用同一套「保最新」的規則，行為對使用者是一致的。
  *
  * 被降級的圖不會憑空消失 —— 內容裡會補一行「[已省略的圖片：檔名]」，模型知道這裡本來
  * 有圖，使用者從對話也看得出來。
@@ -304,7 +308,8 @@ export async function loadImages(
   env: Env,
   user: UserRow,
   messages: ChatMsg[],
-  seesImages: boolean
+  seesImages: boolean,
+  maxImgs?: number
 ): Promise<{ err?: string }> {
   const ids: number[] = [];
   for (const m of messages) if (m.fileIds) for (const id of m.fileIds) ids.push(id);
@@ -333,6 +338,10 @@ export async function loadImages(
   // 第一輪：從最新往回走，決定哪些留、哪些降級（先不讀內容 —— R2 讀取要平行化）
   const want: { m: ChatMsg; rows: FileRow[] }[] = [];
   let budget = PG_LIMITS.maxImgBytesTotal;
+  // 張數預算：整趟請求總共還能送幾張（不是每則訊息各自算）。上游的限制講的是
+  // 「one prompt」，而一次請求＝一個 prompt，所以要跨訊息一起數。
+  // 沒帶＝沿用站上的單則上限，行為跟 v2.4.1 之前一樣。
+  let slots = maxImgs == null ? PG_LIMITS.maxImgPerMsg : maxImgs;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m.fileIds || !m.fileIds.length) continue;
@@ -341,12 +350,13 @@ export async function loadImages(
     for (const id of m.fileIds) {
       const row = byId.get(id);
       const label = (row && row.name) || "圖片";
-      if (!row || row.purged || !seesImages || Number(row.bytes) > budget) {
+      if (!row || row.purged || !seesImages || Number(row.bytes) > budget || slots <= 0) {
         dropped.push(label);
         continue;
       }
       rows.push(row);
       budget -= Number(row.bytes) || 0;
+      slots--;
     }
     if (rows.length) want.push({ m: m, rows: rows });
     if (dropped.length) {

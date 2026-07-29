@@ -7,7 +7,7 @@
 
 import type { Env } from "../types.js";
 
-export const VERSION = "2.4.0"; // 站台版本（/api/health 回報；發佈時同步 git tag）
+export const VERSION = "2.4.1"; // 站台版本（/api/health 回報；發佈時同步 git tag）
 
 // 靜態資產的快取破壞參數（2026-07-22 收斂成單一常數）。
 // public/assets/*.js 有 4 小時的邊緣／瀏覽器快取，改了就要把這個值調大，否則回訪的
@@ -342,10 +342,19 @@ export function pageShell(o: PageShellOpts): string {
     o.h1 +
     '</h1><div class="ctrls">' +
     '<button id="langToggle" class="ctrl" title="Language / 語言">EN</button>' +
+    // 右上角這一格是「日夜切換 ⇄ New chat」的變形鈕（2026-07-30）：兩顆鈕疊在同一格，
+    // 由 playground 依捲動進度餵 --morph（0→1）交叉淡出。手機沒有常駐側欄，聊天一長
+    // 就得先開側欄才點得到 New chat —— 而右上角那一格在捲動時本來就是閒著的。
+    // 只有 playground 會去驅動它；其他頁 --morph 永遠是 0，等於完全不存在。
+    '<span class="cmorph" id="cMorph">' +
     // 初始內容＝月亮（伺服器預設輸出 data-theme="dark"）；腳本讀完 localStorage 再換成正確那顆
     '<button id="themeToggle" class="ctrl" title="Day / Night">' +
     ICON_MOON +
-    "</button></div></header>\n" +
+    "</button>" +
+    '<button id="quickNew" class="ctrl" title="New chat" aria-label="開新對話" data-i18n-aria="sb.newchat" aria-hidden="true" tabindex="-1">' +
+    ICON_NEW +
+    "</button>" +
+    "</span></div></header>\n" +
     '  <div class="content"><div class="wrap">\n' +
     o.body +
     "\n" +
@@ -429,8 +438,22 @@ const SHELL_CSS = `
   .ctrl{height:34px;min-width:34px;padding:0 11px;border:0;background:none;color:var(--muted);border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;line-height:1;font-family:inherit;transition:.15s;display:inline-flex;align-items:center;justify-content:center;text-decoration:none}
   .ctrl:hover{background:var(--hov);color:var(--fg)}
   #themeToggle{width:34px;padding:0;font-size:15px}
+  /* ── 右上角變形鈕：日夜切換 ⇄ New chat（2026-07-30）──
+     兩顆鈕疊在同一格，位置與大小完全一致，靠 --morph（0→1）交叉淡出＋反向旋轉。
+     刻意**不加 transition**：這是捲動驅動的動畫，要一格一格跟著手指走，
+     補間動畫反而會讓它慢半拍、變成「捲完才追上來」。 */
+  .cmorph{position:relative;display:inline-flex;--morph:0}
+  .cmorph>#quickNew{position:absolute;left:0;top:0;width:100%;height:100%;padding:0;pointer-events:none}
+  .cmorph>#themeToggle{opacity:calc(1 - var(--morph));transform:rotate(calc(var(--morph) * -90deg)) scale(calc(1 - var(--morph) * .35))}
+  .cmorph>#quickNew{opacity:var(--morph);transform:rotate(calc((1 - var(--morph)) * 90deg)) scale(calc(.65 + var(--morph) * .35))}
+  /* 過半才換手：看得到哪顆就點得到哪顆，不會有「看起來是 A、按下去是 B」 */
+  .cmorph.n>#themeToggle{pointer-events:none}
+  .cmorph.n>#quickNew{pointer-events:auto}
+  @media(prefers-reduced-motion:reduce){.cmorph>.ctrl{transform:none}}
   /* 桌機：側欄展開時頁首的開啟鈕藏起來（側欄內已有收合鈕） */
   @media(min-width:840px){.app:not(.nosb) #sbToggle{display:none}}
+  /* 同一個條件下 New chat 就攤在側欄裡，右上角不必再變一顆出來（JS 也會一併鎖成 0） */
+  @media(min-width:840px){.app:not(.nosb) .cmorph>#quickNew{display:none}}
   .content{flex:1;min-height:0;overflow-y:auto;padding:22px 16px 48px}
   .wrap{max-width:720px;margin:0 auto}
   /* 細滾動條（全站） */
@@ -864,6 +887,31 @@ const SHELL_JS = `
   var nc=document.getElementById("sbNewChat");
   if(nc)nc.addEventListener("click",function(e){
     if(isPg()&&window.__pgNewChat){e.preventDefault();window.__pgNewChat();}
+  });
+  /* ── 右上角變形鈕（2026-07-30）──
+     playground 捲動時餵進度（0＝日夜切換、1＝New chat）。放在外殼而不是頁面腳本，
+     因為頁首與 sbNewChat 的行為都歸外殼管；playground 只負責「捲到哪了」這個數字。 */
+  var cm=document.getElementById("cMorph"),qn=document.getElementById("quickNew");
+  window.__ipuaMorph=function(p){
+    if(!cm)return;
+    /* 側欄本來就攤開在旁邊時一律不變形 —— New chat 就在眼前，沒必要搶頁首這一格。
+       這一段要跟 CSS 的 @media 條件對齊，否則會出現「鈕被 display:none 了，
+       themeToggle 卻還被鎖著 pointer-events」的死角。 */
+    var app=document.querySelector(".app");
+    if(window.matchMedia("(min-width:840px)").matches&&app&&!app.classList.contains("nosb"))p=0;
+    p=p<0?0:(p>1?1:p);
+    cm.style.setProperty("--morph",String(p));
+    var on=p>=.5;
+    cm.classList.toggle("n",on);
+    /* 讀螢幕與鍵盤 Tab 只看得到「目前這顆」 */
+    if(qn){qn.setAttribute("aria-hidden",on?"false":"true");qn.tabIndex=on?0:-1;}
+    var tt=document.getElementById("themeToggle");
+    if(tt){tt.setAttribute("aria-hidden",on?"true":"false");tt.tabIndex=on?-1:0;}
+  };
+  if(qn)qn.addEventListener("click",function(e){
+    e.preventDefault();
+    if(isPg()&&window.__pgNewChat){window.__pgNewChat();return;}
+    location.href="/playground";
   });
   /* --- 管理員工具（✎ 編輯模式）：登入過後台的裝置（localStorage 有金鑰）
          或本機開發才載入 /assets/adminbar.js；一般訪客完全不會下載這支程式 --- */

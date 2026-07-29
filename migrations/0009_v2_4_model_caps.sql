@@ -1,0 +1,22 @@
+-- Migration 0009 — v2.4.1：上游模型能力快取（目前只用到「單次請求最多幾張圖」）。
+--
+-- 為什麼要有這個欄位（2026-07-30 線上事故）：
+--   會員一次丟 4 張圖問問題 → 上游回 400
+--   {"error":"At most 1 image(s) may be provided in one prompt. (parameter=image)"}
+-- 我們這邊寫死「單則最多 4 張」（PG_LIMITS.maxImgPerMsg），跟模型實際吃幾張毫無關係。
+-- 而這是**逐模型**的差異，不是平台的：Venice 的 62 個視覺模型裡 58 個吃得下多張
+-- （maxImages 多為 10，最高 20），只有 4 個限 1 張 —— 剛好選中的那個就是其中之一。
+--
+-- 為什麼快取在 relay_channels 而不是開新表：
+--   chat.ts 本來就要 `SELECT * FROM relay_channels WHERE slug=?`，能力跟著那一列一起回來，
+--   聊天路徑上**零額外查詢**。免費方案每請求 10ms CPU，這條路上能省的都要省（ADR-0011）。
+--
+-- 內容格式：JSON 物件，模型名 → 單次請求最多幾張圖。例：
+--   {"gemma-4-uncensored":1,"qwen3-vl-235b-a22b":10}
+-- 空字串（預設）＝還沒問過上游，一律套用內建預設值 —— 舊資料行為完全不變。
+-- 沒列進來的模型也是套預設，所以上游少報幾個模型不會有事。
+--
+-- 誰來寫：src/lib/modelcaps.ts 去打上游的 /v1/models，把回應裡的能力欄位挑出來。
+-- 觸發時機是每日 cron 與「管理員存檔管道」兩處，聊天路徑永遠不會即時去問上游。
+-- 上游沒有能力欄位（大多數 OpenAI 相容服務都沒有）＝這欄留空，退回預設值，不影響運作。
+ALTER TABLE relay_channels ADD COLUMN model_caps TEXT NOT NULL DEFAULT '';

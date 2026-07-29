@@ -130,9 +130,9 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Honest comparison vs one-api / LiteLLM / OpenRouter / AI Gateway](./docs/COMPARISON.md) ·
 [Known debt](./DEBT.md) · [Security policy](./SECURITY.md)
 
-## Engineering evidence (v2.4.0)
+## Engineering evidence (v2.4.1)
 
-- **510 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
+- **533 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced

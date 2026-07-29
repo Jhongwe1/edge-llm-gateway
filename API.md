@@ -413,7 +413,8 @@ curl -X PUT https://uaip.cc.cd/api/admin/prices ^
 | `models` | **必填** 這個管道可用的模型名稱（陣列，或逗號／換行分隔的字串；限英數與 `. _ / : -`、上限 40 個）。會員頁與 Playground 都靠這份清單 |
 | `system_prompt` | **選填** 這個管道在 **Playground** 的系統提示詞（上限 8000 字，超過回 400、不截斷）。**留空＝套用站台預設**（`PUT /api/admin/settings` 的 `pg_default_system`，沒設過就是程式內建的 `PG_DEFAULT_SYSTEM`；管理員視窗那格的灰字顯示的就是當下實際會套的那段）；填了就**整段取代**預設。要一次改掉全部渠道的人設就改站台預設，不必逐個渠道填。**只作用在 `/playground`**：`/relay` API 中轉是透明代理，一律不注入任何提示詞 — 會員自己送什麼就轉什麼 |
 | `sort_order` | **選填**（2026-07-29 v2.3）整數，決定 **Playground 模型選單裡「管道之間」的先後**（小的在前；同分退回 id，所以舊資料順序不變）。管道**之內**的模型順序照 `models` 的行序 —— 想調哪個模型排前面，把它移到清單第一行即可。**沒帶＝維持原值**（跟 `api_key` 同一套 undefined 語意，普通的欄位編輯不會把排序洗掉）。網頁上在 /relay 管道列表用 ↑↓ 調整 |
-| `vision_models` | **選填**（2026-07-29 v2.3）這個管道裡**看得懂圖片**的模型（陣列或換行/逗號分隔字串），**必須是 `models` 的子集**（填了沒開放的模型回 400）。**留空＝這個管道不支援附圖**——各家都沒有查詢模型能力的端點、名字也看不出來，所以一律預設不支援，管理員明確填了才開放。會員在 /playground 的附件鈕會依這份清單決定能不能點 |
+| `vision_models` | **選填**（2026-07-29 v2.3）這個管道裡**看得懂圖片**的模型（陣列或換行/逗號分隔字串），**必須是 `models` 的子集**（填了沒開放的模型回 400）。**留空＝這個管道不支援附圖**（安全預設）。**v2.4.1 起這欄變成後備**：上游若回報模型能力（見 `model_caps`）就以上游為準，這份人工清單只在上游不回報時才用得到 —— 也就是說接 Venice 這類會回報能力的上游時，管理員不必再維護它 |
+| `model_caps` | **唯讀**（2026-07-30 v2.4.1）上游自己回報的模型能力快取，JSON「模型名 → 單次請求最多幾張圖」，例 `{"gemma-4-uncensored":1}`；**0＝上游明說這個模型看不了圖**，沒有這個鍵＝還沒問到。由伺服器維護（每日 cron ＋ 管理員存檔管道時各問一次上游的 `/v1/models`），**PUT 帶這欄無效**。上游不回報能力（多數 OpenAI 相容服務的 `/v1/models` 只回模型名）就一直是空的，全站退回 `vision_models` ＋ 內建的張數預設值 |
 | `extra_body` | **選填** 合併進 **Playground** 上游請求本體的額外參數，必須是 **JSON 物件字串**（上限 4000 字；存檔當下就驗，不合法回 400）。**留空＝不合併任何東西**（注意：跟 `system_prompt` 的「留空＝套預設」相反，網頁上那格的灰字只是範例）。用來處理各家專屬參數，例 `{"venice_parameters":{"include_venice_system_prompt":false}}`、OpenAI 的 `reasoning_effort`、Anthropic 的 `thinking`。`model`／`stream`／`messages`／`contents` 擋著**不給覆寫**。**只作用在 `/playground`**，`/relay` 中轉不注入 |
 | `enabled` | 預設 true |
 
@@ -492,7 +493,7 @@ Authorization: Bearer uak-你的金鑰
 
 **體驗模式也一起噤聲**：dumb 開著時匿名訪客的 `models` 同樣只回 `{ demo:true, rows:[], dumb:true }`，`chat` 的 channel/model 也被蓋掉。但蓋成的是**體驗模式自己的**設定（`demo_channel` ＋ `demo_models` 的第一個；白名單留空就取該渠道的第一個模型），**不是** `dumb_channel`/`dumb_model` — 因為體驗模式的 fail-closed 限流與 `demo_max_tokens` 全綁在 `demo_channel` 上，被 dumb 的渠道蓋掉等於那些燒錢上限一起失效。也就是說 dumb 對體驗模式只做「不讓訪客挑」，跑哪個仍由體驗模式的設定決定。
 
-- `GET /api/playground/models` → `{ rows:[{ slug, name, models, vision }] }`（只列啟用中且有設模型的渠道；**不含 `kind`** — 那等於標示真實提供商）。`vision` 是該渠道裡**看得懂圖片**的模型子集（管理員在管道的 `vision_models` 標的，沒標＝空陣列）。dumb mode 下改回 `{ rows:[], dumb:true, vision:true|false }` — 模型名保密，但「能不能附圖」得讓前端知道，否則附件鈕只能一律關掉或一律開著。
+- `GET /api/playground/models` → `{ rows:[{ slug, name, models, vision, imgmax }] }`（只列啟用中且有設模型的渠道；**不含 `kind`** — 那等於標示真實提供商）。`vision` 是該渠道裡**看得懂圖片**的模型子集（來源：上游回報的能力優先，上游不回報才看管理員填的 `vision_models`；都沒有＝空陣列）。`imgmax` 是 `{ 模型名: 單則最多幾張圖 }`（**2026-07-30 v2.4.1**），前端據此在挑圖當下就擋住 —— 有些模型單次只吃 1 張，多送上游直接回 400。dumb mode 下改回 `{ rows:[], dumb:true, vision:true|false, imgmax:數字 }` — 模型名保密，但「能不能附圖」與「最多幾張」得讓前端知道，否則使用者只能挑完圖、送出後才看到一句看不懂的錯誤。
 - `GET /api/playground/conversations` → `{ rows:[{ id, title, channel, model, created_at, updated_at }] }`（自己的，新→舊，最多 100 筆）。**管理員要看全站所有人的對話**看 §5 的 `/api/admin/conversations`（或 /logs 的「總對話紀錄」分頁）。
 - `GET /api/playground/conversations/{id}` → `{ conv, messages:[{ id, role, content, model, created_at }], files:[{ id, msg_id, mime, name, bytes, w, h, purged }] }`。`files` 是整串對話的附件中繼資料（前端按 `msg_id` 分回各則訊息）；**內容要另外打 `/api/playground/files/{id}`**。`purged:1`＝內容已被清除，中繼資料留著讓前端畫「檔案已刪除」。
 - `PUT /api/playground/conversations/{id}` 本體 `{ "title":"新名字" }` 改名；`DELETE` 刪除（連同訊息**與附件**）。
@@ -555,7 +556,8 @@ Authorization: Bearer uak-你的金鑰
   "messages":[ { "role":"user", "content":"這張圖是什麼？", "files":[12,13] } ] }
 ```
 
-  - 模型必須被管理員標進該管道的 `vision_models`，否則回 400 `no-vision`（**檢查在建立對話之前** — 不留下「訊息存了但圖沒送到」的半吊子狀態）。
+  - 模型必須看得懂圖片（上游回報的能力優先，其次是管理員標的 `vision_models`），否則回 400 `no-vision`（**檢查在建立對話之前** — 不留下「訊息存了但圖沒送到」的半吊子狀態）。
+  - **張數超過該模型的上限時，多的圖會從最舊的開始降級成文字佔位**（跟總 bytes 超標的處理一樣，內容裡補一行 `[已省略的圖片：檔名]`），不是回錯誤 —— 上限本身見 `model_caps`。
   - 單則最多 4 張；**單次請求所有圖片的原始大小合計上限 1.5MB**。這個數字是量出來的：組上游 body 的成本 933KB→1.62ms、1.8MB→3.31ms、2.8MB→6.00ms，而這筆花費發生在**串流開始之前**，花掉的每一毫秒都是從串流迴圈的預算裡扣的。
   - 超出預算、或模型看不了圖（歷史訊息）、或內容已被清除 → 那幾張**降級成文字佔位**「[已省略的圖片：檔名]」而不是報錯。原則是**不要因為附件的問題讓人連話都說不出來**：從最舊的開始降級，最新那張（通常就是他正在問的）保到最後。
   - 別人的檔案編號塞進來一律查不到（`WHERE user_id=自己`），靜默降級成佔位，不會洩漏任何內容。

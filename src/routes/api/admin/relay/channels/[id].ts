@@ -5,7 +5,8 @@ import { json } from "../../../../../lib/site.js";
 import { adminOk } from "../../../../../lib/auth.js";
 import { audit } from "../../../../../lib/observe.js";
 import { cleanChannel, maskRow } from "./index.js";
-import type { RouteCtx } from "../../../../../types.js";
+import { refreshChannelCaps } from "../../../../../lib/modelcaps.js";
+import type { ChannelRow, RouteCtx } from "../../../../../types.js";
 
 function idOf(params: RouteCtx["params"]): number | null {
   const id = parseInt(String(params.id), 10);
@@ -54,6 +55,10 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
       )
       .run();
     const row = await env.DB.prepare("SELECT * FROM relay_channels WHERE id=?1").bind(id).first();
+    // 管道存檔後順手去問一次上游的模型能力（單次吃幾張圖，migration 0009）——
+    // 管理員改了 models／base_url 之後不必等隔天的 cron。掛在 waitUntil：
+    // 這是背景維護，不該讓存檔的回應多等一次子請求。失敗完全無害（沿用舊快取）。
+    if (row) context.waitUntil(refreshChannelCaps(env, row as unknown as ChannelRow));
     // 稽核不落金鑰本體，只記這次動作有沒有動到金鑰
     const keyNote = c.ch.api_key === undefined ? "保留" : c.ch.api_key ? "更新" : "清除";
     audit(

@@ -114,7 +114,6 @@ const PG_CSS = `
   .pg-plus:hover{background:var(--hov)}
   /* 目前模型看不了圖片：整顆鈕變灰。刻意不用 disabled —— 那樣按下去不會有任何反應，
      使用者只會覺得功能壞了；留著可按才有機會解釋「換個模型就能傳圖」。 */
-  .pg-plus.off{color:var(--sub);opacity:.5}
   /* overflow-y 平常藏起來，長文超過 max-height 時才由 autoGrow 放出捲軸 */
   .pg-ta{flex:1;resize:none;border:0;background:none;color:var(--fg);
          padding:8px 6px;font-size:15px;font-family:inherit;line-height:1.55;outline:none;
@@ -266,6 +265,7 @@ const PG_JS = `
   var demoMode=false;  // 體驗模式（未登入＋管理員開 demo）：無歷史（對話只有管理員看得到）
   var dumbMode=false;  // Dumb mode（v2.2）：模型被管理員鎖定且隱藏 — 沒有模型選單、送出不帶模型
   var dumbVision=false;// dumb 模式下前端不知道模型是誰，只由伺服器告知「能不能附圖」
+  var dumbImgmax=0;    // 同上：dumb 模式下的「單則最多幾張圖」（0＝伺服器沒說，不特別限制）
   var streaming=false,aborter=null;
   var UI={};
   var model="";        // 目前選的模型（"channelSlug|modelName"）
@@ -349,7 +349,7 @@ const PG_JS = `
           if(!s.demo){paint();return;}
           demoMode=true;
           /* dumb 開著時體驗模式同樣拿到空清單＋dumb:true — 沒有模型選單，照樣能聊 */
-          return api("/api/playground/models").then(function(r){groups=r.rows||[];dumbMode=!!r.dumb;dumbVision=!!r.vision;buildApp();});
+          return api("/api/playground/models").then(function(r){groups=r.rows||[];dumbMode=!!r.dumb;dumbVision=!!r.vision;dumbImgmax=r.imgmax||0;buildApp();});
         });
       }
       if(!hasSvc()){paint();return;}
@@ -357,6 +357,7 @@ const PG_JS = `
         groups=r.rows||[];
         dumbMode=!!r.dumb;   // 模型被鎖定且隱藏：清單是空的但照樣能聊
         dumbVision=!!r.vision;
+        dumbImgmax=r.imgmax||0;
         paint();
         /* 側欄 History 由外殼載入；#c=<id> 進來（他頁點歷史）就直接打開那筆 */
         var m=location.hash.match(/^#c=(.+)$/);
@@ -410,15 +411,31 @@ const PG_JS = `
           model=x.v;
           try{localStorage.setItem("ipua-pg-model",model);}catch(e){}
           updateTitle();
-          updatePlus();   /* ＋ 鈕的灰／亮跟著新模型的視覺能力走 */
-          /* 換到看不了圖的模型時，還掛著的圖片附件會在送出時被伺服器擋下來（400）。
-             與其讓人打完字才發現，不如當下就清掉並講明原因。 */
+          /* 換模型時，已經掛著的圖片可能就不合新模型的規矩了。與其讓人打完字才發現，
+             不如當下就處理掉並講明原因。兩種情況：
+               看不了圖   → 圖片全部移除（文件留著，它們跟 vision 無關）
+               張數變少   → 只留前幾張（保留挑選順序，多的那幾張移除） */
           if(!seesImages()){
             var had=atts.filter(function(a){return a.kind==="image";}).length;
             if(had){
               atts=atts.filter(function(a){return a.kind!=="image";});
               renderAtts();
               MU.flash(tx("這個模型看不了圖片，已移除附加的圖片","This model can't read images — attached images removed"));
+            }
+          }else{
+            var lim2=maxImgs();
+            if(lim2&&imgCount()>lim2){
+              var seen=0;
+              atts=atts.filter(function(a){
+                if(a.kind!=="image")return true;
+                seen++;return seen<=lim2;
+              });
+              renderAtts();
+              MU.flash(lim2===1
+                ?tx("這個模型一次只看得懂 1 張圖，已只留下第 1 張",
+                    "This model reads only 1 image at a time — kept the first one")
+                :tx("這個模型一次最多 "+lim2+" 張圖，多的已移除",
+                    "This model takes at most "+lim2+" images — extras removed"));
             }
           }
         });
@@ -491,7 +508,8 @@ const PG_JS = `
     UI.msgs=el("div","pg-msgs");
     UI.msgs.addEventListener("scroll",function(){
       UI.stick=UI.msgs.scrollHeight-UI.msgs.scrollTop-UI.msgs.clientHeight<90;
-    });
+      morphNew();
+    },{passive:true});
     UI.stick=true;
     app.appendChild(UI.msgs);
 
@@ -516,8 +534,8 @@ const PG_JS = `
     UI.plus=el("button","pg-plus");
     UI.plus.type="button";UI.plus.textContent="\\uff0b";
     UI.plus.addEventListener("click",function(e){e.stopPropagation();attachClick();});
+    UI.plus.title=tx("附加檔案","Attach files");
     row.appendChild(UI.plus);
-    updatePlus();
     UI.ta=el("textarea","pg-ta");
     UI.ta.rows=1;
     UI.ta.placeholder=tx("詢問任何問題","Ask anything");
@@ -571,6 +589,23 @@ const PG_JS = `
     renderMsgs();
   }
 
+  /* 右上角「日夜切換 ⇄ New chat」變形鈕的驅動（2026-07-30）。
+     這裡只算一個 0→1 的進度餵給外殼（外殼負責畫、負責點下去要做什麼）。
+
+     MORPH_PX＝捲多少距離換完。90px 大約是手機上一個小滑動的量：
+     太短會在手指微動時就翻面（看起來像閃爍），太長則要捲很久才等到 New chat。
+     判斷用的是「離頂端多遠」而不是「離底端多遠」—— 聊天是往下長的，串流時畫面
+     一直黏在底部，用離底端算的話會在生成過程中一直抖。
+
+     還沒長到可以捲（scrollHeight 幾乎等於視窗高）就一律回 0：短對話不該讓
+     日夜切換莫名其妙消失。 */
+  var MORPH_PX=90;
+  function morphNew(){
+    if(!window.__ipuaMorph||!UI.msgs)return;
+    var room=UI.msgs.scrollHeight-UI.msgs.clientHeight;
+    window.__ipuaMorph(room<MORPH_PX?0:UI.msgs.scrollTop/MORPH_PX);
+  }
+
   /* ================= 附件（v2.3）================= */
   /* 待送出的附件。兩種形狀：
        { kind:"image", id, url, name, bytes }  已上傳完成，送出時只帶 id
@@ -592,33 +627,43 @@ const PG_JS = `
     return false;
   }
 
-  /* 附件功能的總開關：目前的模型看不了圖＝整個附件功能關閉。
-     這是站長 2026-07-29 拍板的行為 —— 一開始做成「灰色但仍可傳文件」（文件本來就不需要
-     vision），但那樣「灰掉的按鈕按下去還是跳出檔案選擇器」會讓人以為壞了。
-     一致、可預測比多留一點功能重要：要用附件就切一個看得懂圖的模型，文件也一起解鎖。 */
-  function attachBlocked(){
-    if(seesImages())return false;
-    MU.flash(tx("目前的模型看不了圖片 — 請換一個支援視覺的模型",
-                "This model can't read images — switch to a vision model"));
-    return true;
+  /* 目前的模型單則最多吃幾張圖（v2.4.1）。數字由伺服器算好（上游自己回報的能力，
+     見 lib/modelcaps.ts）；取不到就回 0＝不特別限制，交給下面那道 8 個附件的總上限。
+     為什麼要在前端擋：有些模型單次只吃 1 張，多送上游直接回 400，而會員看到的只會是
+     「上游回應異常」這種無解的字（2026-07-30 事故）。挑第 2 張的當下就講清楚，
+     比讓他打完問題、送出、再看到一句看不懂的錯誤好太多。 */
+  function maxImgs(){
+    if(dumbMode)return dumbImgmax||0;
+    if(!model)return 0;
+    var pi=model.indexOf("|");
+    var cs=pi<0?"":model.slice(0,pi),mn=pi<0?"":model.slice(pi+1);
+    for(var i=0;i<groups.length;i++){
+      if(groups[i].slug===cs)return (groups[i].imgmax||{})[mn]||0;
+    }
+    return 0;
+  }
+
+  /* 目前待送出的附件裡有幾張圖（文件不算 —— 它在送出時會被轉成文字併進訊息，
+     根本不會變成上游眼中的圖片） */
+  function imgCount(){
+    var n=0;
+    for(var i=0;i<atts.length;i++)if(atts[i].kind==="image")n++;
+    return n;
   }
 
   /* ＋ 按下去：直接開檔案選擇器，不插一層「上傳照片／上傳檔案」的選單 ——
-     多一次點擊只為了選類別，而檔案選擇器本來就分得出來。 */
+     多一次點擊只為了選類別，而檔案選擇器本來就分得出來。
+
+     ＋ 永遠是亮的、永遠打得開（2026-07-30 改；在此之前模型看不了圖就整個附件功能關掉）。
+     改回來的理由有兩個：
+       1. **文件根本不需要 vision** —— PDF／Office 是在瀏覽器裡抽成文字才送出的，
+          對上游來說就是一段普通文字。為了圖片的限制把文件一起鎖死是多擋的。
+       2. 限制改成擋在「挑到不能用的那個檔案」那一刻，訊息可以講得很具體
+          （看不了圖／最多幾張），比一個灰按鈕能傳達的資訊多得多。
+     一句話：閘門從「功能總開關」下放到「單一檔案」，能做的事變多、講的話變準。 */
   function attachClick(){
     if(!window.PGA){MU.flash(tx("附件功能載入失敗，請重新整理","Attachment module failed to load — please refresh"));return;}
-    if(attachBlocked())return;   /* 只提示，不開選擇器 */
     pickFiles();
-  }
-
-  /* ＋ 按鈕的狀態跟著「目前模型能不能看圖」走。用 class 不用 disabled：
-     disabled 的按鈕收不到 click，就沒辦法在按下去時解釋原因了。 */
-  function updatePlus(){
-    if(!UI.plus)return;
-    var ok=seesImages();
-    UI.plus.classList.toggle("off",!ok);
-    UI.plus.title=ok?tx("附加檔案","Attach files")
-      :tx("目前的模型看不了圖片","Current model can't read images");
   }
 
   function pickFiles(){
@@ -639,15 +684,34 @@ const PG_JS = `
      每個檔案各自成敗、互不影響 —— 一個壞檔不該讓整批都白選。 */
   function addFiles(files){
     if(streaming){MU.flash(tx("回覆生成中 — 先按停止","Still streaming — stop it first"));return;}
-    /* 拖放與貼上也走這裡。跟 ＋ 按鈕擋在同一道門後面 —— 否則就會變成
-       「按鈕擋得住、把檔案拖進來卻可以」的隱藏後門，那種不一致最難跟使用者解釋。 */
-    if(attachBlocked())return;
+    /* 拖放與貼上也走這裡，所以圖片的兩道檢查（看不看得了圖、最多幾張）寫在這個
+       函式裡而不是 ＋ 按鈕上 —— 否則就會變成「按鈕擋得住、把檔案拖進來卻可以」的
+       隱藏後門，那種不一致最難跟使用者解釋。 */
     /* 伺服器算好的壓縮目標（window.__PGFILE，見 playgroundPageResponse）。
        取不到就退回 1400KB —— 那是純 D1 模式的上限，任何模式下都收得進去。 */
     var maxBytes=(window.__PGFILE&&window.__PGFILE.max)||1400*1024;
+    var canImg=seesImages(),lim=maxImgs();
     files.forEach(function(f){
       if(atts.length>=8){MU.flash(tx("一次最多 8 個附件","Up to 8 attachments at a time"));return;}
       if(PGA.isImage(f)){
+        /* 這個模型根本看不了圖。只擋圖片 —— 同一批裡的文件照收，它們會被轉成文字，
+           跟 vision 無關。 */
+        if(!canImg){
+          MU.flash(tx("這個模型看不了圖片 — 請換一個支援視覺的模型",
+                      "This model can't read images — switch to a vision model"));
+          return;
+        }
+        /* 模型的張數上限：擋在「加進來」這一步，而不是送出時才砍掉 —— 使用者要能
+           當場看到自己到底送得出去幾張，而不是以為 5 張都送到了、模型卻只看到 1 張。
+           （2026-07-30 事故就是這樣：一次丟 4 張，上游只吃 1 張，直接回 400。）
+           1 張的模型講法特別寫過：那是最容易讓人以為壞掉的情況。 */
+        if(lim&&imgCount()>=lim){
+          MU.flash(lim===1
+            ?tx("這個模型一次只看得懂 1 張圖 — 想比較多張請換一個模型",
+                "This model reads only 1 image at a time — switch models to compare several")
+            :tx("這個模型一次最多 "+lim+" 張圖","This model takes at most "+lim+" images at a time"));
+          return;
+        }
         var ph={kind:"image",name:f.name,bytes:f.size,busy:true,url:""};
         atts.push(ph);renderAtts();
         PGA.toImage(f,maxBytes).then(function(img){
@@ -761,12 +825,14 @@ const PG_JS = `
   function renderMsgs(){
     UI.msgs.innerHTML="";
     setEmpty();
-    if(!msgs.length)return;
+    if(!msgs.length){morphNew();return;}   /* 清空＝捲動歸零，右上角要變回日夜切換 */
     msgs.forEach(function(m){
       if(m.role==="user")addUserMsg(m.content,m.files);
       else addAiMsg(m.content,true);
     });
     UI.stick=true;scrollBottom(true);
+    /* 內容被整批換掉時瀏覽器不保證會補一次 scroll 事件，這裡自己算一次 */
+    morphNew();
   }
   function scrollBottom(force){
     if(force||UI.stick)UI.msgs.scrollTop=UI.msgs.scrollHeight;
@@ -922,6 +988,26 @@ const PG_JS = `
     var docs=atts.filter(function(a){return a.kind==="doc";});
     if(!text.trim()&&!imgs.length&&!docs.length)return;
     if(!model&&!dumbMode){MU.flash(tx("先選一個模型","Pick a model first"));return;}
+    /* 送出前最後一道圖片檢查（2026-07-30）。加圖時與換模型時都已經擋過一輪，
+       這裡是收口：任何繞過前兩關的路徑（模型清單重載、上傳競態、把舊分頁擱著很久
+       才按送出）都會在這裡被攔下來，而不是送出去讓伺服器默默砍掉幾張、或吃上游一發
+       400。擋下來不清空輸入框 —— 使用者打的字跟挑的圖都還在，改完就能直接再送。 */
+    if(imgs.length){
+      if(!seesImages()){
+        MU.flash(tx("這個模型看不了圖片 — 請換一個支援視覺的模型，或把圖片移除",
+                    "This model can't read images — switch models or remove the images"));
+        return;
+      }
+      var lim3=maxImgs();
+      if(lim3&&imgs.length>lim3){
+        MU.flash(lim3===1
+          ?tx("這個模型一次只看得懂 1 張圖 — 請移除多餘的圖片，或換一個模型",
+              "This model reads only 1 image at a time — remove the extras or switch models")
+          :tx("這個模型一次最多 "+lim3+" 張圖 — 請移除多餘的圖片",
+              "This model takes at most "+lim3+" images — please remove the extras"));
+        return;
+      }
+    }
     // Dumb mode：channel/model 留空 — 伺服器端會蓋成管理員指定的值
     var pi=model.indexOf("|"),channel=pi<0?"":model.slice(0,pi),mname=pi<0?"":model.slice(pi+1);
 

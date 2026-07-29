@@ -27,9 +27,9 @@ import {
   extractUsage,
   chModels,
   dumbCfg,
-  loadImages,
-  modelSeesImages
+  loadImages
 } from "../../../lib/playground.js";
+import { maxImagesFor, seesImagesFor } from "../../../lib/modelcaps.js";
 import { fastDelta } from "../../../lib/fastsse.js";
 import { checkQuota } from "../../../lib/quota.js";
 import { demoCfg, demoUser, demoCheck, demoLockedModel, DEMO_DEFAULTS } from "../../../lib/demo.js";
@@ -167,11 +167,12 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   if (!ch.api_key)
     return json({ error: "no-upstream-key", hint: "渠道還沒設定上游金鑰，請管理員到 /relay 補上" }, 502);
 
-  // 附件（v2.3）：模型吃不吃圖是管理員在管道裡明確標的（vision_models，migration 0007）。
+  // 附件（v2.3）：模型吃不吃圖以**上游回報的能力**為準，上游不回報才看管理員標的
+  // vision_models（migration 0007／0009，見 lib/modelcaps.ts）。
   // 這一則帶了圖、模型卻看不了 → 在**建立對話之前**就擋掉，不要留下一個
   // 「訊息存了、圖也綁了、但上游根本收不到圖」的半吊子狀態。
-  // 前端本來就會把不支援的模型的附件鈕變灰，走到這裡代表是直接打 API 或切換過模型。
-  const sees = modelSeesImages(ch, v.model);
+  // 前端挑圖時就會擋，走到這裡代表是直接打 API 或挑完圖才換模型。
+  const sees = seesImagesFor(ch, v.model);
   const lastMsg = v.messages[v.messages.length - 1];
   if (!sees && lastMsg && lastMsg.fileIds && lastMsg.fileIds.length) {
     return json(
@@ -232,8 +233,11 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
     } catch (e) {}
   }
 
-  // 檔案編號 → 實際 base64 內容（含總量預算與降級，見 loadImages）
-  const imgLoad = await loadImages(env, user, v.messages, sees);
+  // 檔案編號 → 實際 base64 內容（含總量預算與降級，見 loadImages）。
+  // 張數上限來自「上游自己回報的模型能力」快取（migration 0009，見 lib/modelcaps.ts）——
+  // 有些模型單次只吃 1 張，照站上寫死的 4 張送過去就是一發 400（2026-07-30 事故）。
+  // 這裡讀的是 ch 那一列上的欄位，沒有額外查詢、也不會即時去問上游。
+  const imgLoad = await loadImages(env, user, v.messages, sees, maxImagesFor(ch, v.model));
   if (imgLoad.err) return json({ error: "no-vision", hint: imgLoad.err, conv: convId }, 400);
 
   // 打上游（demo 有填 demo_max_tokens 才壓回覆長度；留空＝0＝跟會員路徑一樣不設限）
