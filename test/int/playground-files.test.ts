@@ -370,6 +370,86 @@ describe("聊天串接", () => {
     expect(sent).toContain("data:image/webp;base64,");
   });
 
+  it("上游宣稱 10 張但實際回 400 → 學回真正的 1 張，下一次送出前就先砍好", async () => {
+    const u = await approved();
+    // 這正是 google-gemma-4-31b-it 的情況：/v1/models 說 maxImages:10，實際只吃 1
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "m1",
+      base_url: UP,
+      model_caps: '{"m1":10}'
+    });
+    const ids = await upload3(u);
+
+    // 第一趟：照宣稱值送 3 張 → 上游打回 400 並說出真正的上限
+    fetchMock
+      .get(UP)
+      .intercept({ path: "/v1/chat/completions", method: "POST" })
+      .reply(400, '{"error":"At most 1 image(s) may be provided in one prompt. (parameter=image)"}');
+    const c1 = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "看圖", files: ids }]
+    });
+    const r1 = await chat(c1);
+    await drainWaits(c1);
+    expect(r1.status).toBe(400);
+    const j1 = (await r1.json()) as any;
+    expect(j1.error).toBe("too-many-images");
+    expect(j1.hint).toContain("1 張圖"); // 會員看得到具體數字，不是「上游回應異常」
+
+    // 學到的上限進了 seen，而宣稱的 10 還留著（cron 重抓時只會動 adv）
+    const row = await env.DB.prepare("SELECT model_caps FROM relay_channels WHERE id=?1")
+      .bind(ch.id)
+      .first<any>();
+    expect(JSON.parse(row.model_caps)).toEqual({ adv: { m1: 10 }, seen: { m1: 1 } });
+
+    // 第二趟：同樣送 3 張，這次在送出前就被砍成 1 張 → 上游只收到 1 張，不再 400
+    const ch2 = await env.DB.prepare("SELECT * FROM relay_channels WHERE id=?1").bind(ch.id).first<any>();
+    let sent = "";
+    interceptOnce((b) => (sent = b));
+    const c2 = await chatCtx(u, {
+      channel: ch2.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "再看一次", files: ids }]
+    });
+    const r2 = await chat(c2);
+    await readAll(r2);
+    await drainWaits(c2);
+    expect(r2.status).toBe(200);
+    expect(sent.split("data:image/webp;base64,").length - 1).toBe(1);
+  });
+
+  it("跟張數無關的 400 不會亂學（只有講到 image 上限的才學）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({
+      models: "m1",
+      vision_models: "m1",
+      base_url: UP,
+      model_caps: '{"m1":10}'
+    });
+    const up = await upCtx(u, fakeWebp(300));
+    const fid = ((await (await uploadFile(up)).json()) as any).id;
+    await drainWaits(up);
+
+    fetchMock
+      .get(UP)
+      .intercept({ path: "/v1/chat/completions", method: "POST" })
+      .reply(400, '{"error":"Invalid request: bad parameter"}');
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "看圖", files: [fid] }]
+    });
+    const r = await chat(ctx);
+    await drainWaits(ctx);
+    expect(r.status).toBe(502); // 照舊走原本的上游錯誤路徑
+    const row = await env.DB.prepare("SELECT model_caps FROM relay_channels WHERE id=?1")
+      .bind(ch.id)
+      .first<any>();
+    expect(row.model_caps).toBe('{"m1":10}'); // 快取沒被動過
+  });
+
   it("上游說看不了圖 → 就算 vision_models 填了也擋（過期的人工清單不能蓋過上游）", async () => {
     const u = await approved();
     const ch = await seedChannel({

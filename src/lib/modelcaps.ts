@@ -36,30 +36,66 @@ import { PG_LIMITS, chModels, modelSeesImages } from "./playground.js";
 import type { ChannelRow, Env } from "../types.js";
 
 /**
- * 快取內容的形狀：模型名 → 單次請求最多幾張圖。
+ * 快取內容：模型名 → 單次請求最多幾張圖。
  * **0 是有意義的值**，代表「上游說這個模型看不了圖」，跟「沒這個鍵」（沒問到）不一樣。
  */
 export type ModelCaps = Record<string, number>;
 
 /**
- * 把 relay_channels.model_caps 解析回物件。
- * 壞掉／空的一律回空物件 —— 呼叫端因此永遠拿得到可用的值，不必自己 try。
+ * 兩份數字，可信度不同 —— 這是 2026-07-29 晚上用真實請求打出來的教訓：
+ *
+ *   adv （advertised）：上游 /v1/models **自己宣稱**的能力。
+ *   seen（observed）  ：上游**實際回 400 時吐出來**的真實上限。
+ *
+ * 為什麼要分兩份：**Venice 宣稱的數字會騙人。** 實測（2026-07-29）
+ *   google-gemma-4-31b-it  宣稱 maxImages:10 → 實際送 2 張就 400「At most 1 image(s)」
+ *   google-gemma-4-26b-a4b-it／venice-uncensored-1-2／qwen3-5-9b／gemma-3-27b 宣稱 10 → 真的吃 2 張
+ * 也就是說 metadata 大致可信但不是全部可信，而「哪個會騙」事前無從得知。
+ *
+ * seen 永遠壓過 adv，而且**每日 cron 重抓時不會被覆寫** —— 這點是必要的：
+ * cron 在 19:17:49 跑完會把宣稱的 10 原封不動寫回去，如果 seen 不獨立存放，
+ * 我們今天學到的「其實只有 1 張」明天就會被洗掉，事故無限循環。
  */
-export function parseCaps(ch: { model_caps?: unknown } | null | undefined): ModelCaps {
+interface CapsBlob {
+  adv: ModelCaps;
+  seen: ModelCaps;
+}
+
+function toMap(o: unknown): ModelCaps {
+  const out: ModelCaps = {};
+  if (!o || typeof o !== "object" || Array.isArray(o)) return out;
+  for (const k of Object.keys(o as Record<string, unknown>)) {
+    const n = Math.floor(Number((o as Record<string, unknown>)[k]));
+    if (n >= 0) out[k] = n; // 0＝上游明說看不了圖，要保留
+  }
+  return out;
+}
+
+/**
+ * 把 relay_channels.model_caps 解析成 { adv, seen }。
+ * 壞掉／空的一律回兩個空物件 —— 呼叫端因此永遠拿得到可用的值，不必自己 try。
+ *
+ * **相容 v2.4.1 初版的扁平格式**（`{"model":n}`）：那時只有宣稱值，整包當成 adv 讀。
+ * 線上已經有這種資料，不能因為換格式就把它當壞資料丟掉。
+ */
+export function parseCapsBlob(ch: { model_caps?: unknown } | null | undefined): CapsBlob {
   const raw = String((ch && ch.model_caps) || "").trim();
-  if (!raw) return {};
+  if (!raw) return { adv: {}, seen: {} };
   try {
     const j = JSON.parse(raw);
-    if (!j || typeof j !== "object" || Array.isArray(j)) return {};
-    const out: ModelCaps = {};
-    for (const k of Object.keys(j as Record<string, unknown>)) {
-      const n = Math.floor(Number((j as Record<string, unknown>)[k]));
-      if (n >= 0) out[k] = n; // 0＝上游明說看不了圖，要保留
-    }
-    return out;
+    if (!j || typeof j !== "object" || Array.isArray(j)) return { adv: {}, seen: {} };
+    const o = j as Record<string, unknown>;
+    // 新格式一定有 adv 這個鍵；沒有就是舊的扁平格式
+    if (o.adv || o.seen) return { adv: toMap(o.adv), seen: toMap(o.seen) };
+    return { adv: toMap(o), seen: {} };
   } catch (e) {
-    return {};
+    return { adv: {}, seen: {} };
   }
+}
+
+/** 只要宣稱值那一份（refresh 與 vision 判斷用）。 */
+export function parseCaps(ch: { model_caps?: unknown } | null | undefined): ModelCaps {
+  return parseCapsBlob(ch).adv;
 }
 
 /**
@@ -69,11 +105,14 @@ export function parseCaps(ch: { model_caps?: unknown } | null | undefined): Mode
  * 有上游的說法時就以它為準，不再看 vision_models —— 那份清單是人工維護的，
  * 而人工維護的清單一定會過期（新增模型、上游改能力），過期的下場就是會員送出後
  * 吃一發看不懂的 400。上游自己報的能力永遠比管理員記得更新更準。
+ *
+ * 實際打成功過（seen ≥ 1）也算數：上游肯收圖就是會看圖，比它宣稱的更有說服力。
  */
 export function capVision(ch: { model_caps?: unknown } | null | undefined, model: string): boolean | null {
-  const caps = parseCaps(ch);
-  if (!Object.prototype.hasOwnProperty.call(caps, model)) return null;
-  return caps[model] > 0;
+  const { adv, seen } = parseCapsBlob(ch);
+  if (seen[model] >= 1) return true;
+  if (!Object.prototype.hasOwnProperty.call(adv, model)) return null;
+  return adv[model] > 0;
 }
 
 /**
@@ -83,9 +122,53 @@ export function capVision(ch: { model_caps?: unknown } | null | undefined, model
  * 有的話取 min(站上上限, 上游上限) —— 上游只能把數字往下拉，理由見檔頭第 3 點。
  */
 export function maxImagesFor(ch: { model_caps?: unknown } | null | undefined, model: string): number {
-  const n = parseCaps(ch)[model];
+  const { adv, seen } = parseCapsBlob(ch);
+  // 實際撞出來的上限最可信，直接壓過宣稱值（google-gemma-4-31b-it 宣稱 10、實際 1）
+  const n = seen[model] || adv[model];
   if (!n) return PG_LIMITS.maxImgPerMsg; // 沒問到（undefined）與看不了圖（0）都不必給張數
   return Math.min(PG_LIMITS.maxImgPerMsg, n);
+}
+
+/**
+ * 從上游的錯誤訊息裡把「真正的張數上限」讀出來。
+ * 回 null＝這則錯誤跟圖片張數無關（絕大多數 400 都是別的原因，不能亂學）。
+ *
+ * 目前認得 Venice 的講法：`At most 1 image(s) may be provided in one prompt.`
+ * 寫成寬鬆的正則而不是整句比對 —— 其他家的用字不會一樣，但「at most N image」
+ * 這個骨架相當通用；認不出來就是不學，沒有副作用。
+ */
+export function imgLimitFromError(detail: unknown): number | null {
+  const m = /at\s+most\s+(\d+)\s+image/i.exec(String(detail || ""));
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  // 上限 0 不合理（那是「不支援圖片」，會走另一條錯誤訊息）；過大的數字當雜訊
+  return n >= 1 && n <= 1000 ? n : null;
+}
+
+/**
+ * 把「實際撞出來的張數上限」記進 seen，宣稱值那一份原封不動。
+ * 下一次同一個模型就會在**送出之前**被砍到正確張數，不會再吃第二發 400。
+ *
+ * 靜默失敗：這是從錯誤路徑上長出來的學習動作，學不起來頂多是下次再撞一次，
+ * 絕不能因為寫入失敗而讓原本要回給會員的錯誤訊息也跟著掉。
+ */
+export async function learnImgLimit(
+  env: Env,
+  ch: ChannelRow,
+  model: string,
+  limit: number
+): Promise<boolean> {
+  try {
+    const blob = parseCapsBlob(ch);
+    if (blob.seen[model] === limit) return false; // 已經學過了，省一次 D1 寫入
+    blob.seen[model] = limit;
+    await env.DB.prepare("UPDATE relay_channels SET model_caps=?1 WHERE id=?2")
+      .bind(JSON.stringify({ adv: blob.adv, seen: blob.seen }), ch.id)
+      .run();
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 /**
@@ -175,8 +258,12 @@ export async function refreshChannelCaps(env: Env, ch: ChannelRow): Promise<numb
     if (!resp.ok) return -1;
     const caps = pickCaps(await resp.json(), models);
     if (!caps) return -1; // 不回報能力 → 保留舊快取（檔頭第 2 點）
+    // ⚠ seen 一定要原封不動帶過去。cron 每天會把宣稱值重寫一次，如果順手把
+    // seen 也蓋掉，那「實際撞出來只有 1 張」明天就退回宣稱的 10 張，同一發 400
+    // 會每天重演一次（2026-07-29 19:17:49 那趟 cron 就是這樣把 10 寫回去的）。
+    const seen = parseCapsBlob(ch).seen;
     await env.DB.prepare("UPDATE relay_channels SET model_caps=?1 WHERE id=?2")
-      .bind(JSON.stringify(caps), ch.id)
+      .bind(JSON.stringify({ adv: caps, seen: seen }), ch.id)
       .run();
     return Object.keys(caps).length;
   } catch (e) {

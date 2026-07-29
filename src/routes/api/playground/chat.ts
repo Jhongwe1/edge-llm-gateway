@@ -29,7 +29,7 @@ import {
   dumbCfg,
   loadImages
 } from "../../../lib/playground.js";
-import { maxImagesFor, seesImagesFor } from "../../../lib/modelcaps.js";
+import { maxImagesFor, seesImagesFor, imgLimitFromError, learnImgLimit } from "../../../lib/modelcaps.js";
 import { fastDelta } from "../../../lib/fastsse.js";
 import { checkQuota } from "../../../lib/quota.js";
 import { demoCfg, demoUser, demoCheck, demoLockedModel, DEMO_DEFAULTS } from "../../../lib/demo.js";
@@ -285,6 +285,24 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
       "上游回應 HTTP " + resp.status,
       { user_id: user.id, path: "/playground/" + v.channel, detail: detail }
     );
+    // ── 從失敗裡學回真正的張數上限（2026-07-29）──
+    // 上游宣稱的 maxImages 會騙人（google-gemma-4-31b-it 說 10、實際只吃 1），
+    // 但它回錯誤時會把真正的數字寫在訊息裡。記進 seen，下一次就會在送出前先砍好，
+    // 不會再撞第二次。這比事前去逐一試探每個模型便宜得多 —— 只有真的失敗才學一次。
+    const learned = imgLimitFromError(detail);
+    if (learned !== null) {
+      context.waitUntil(learnImgLimit(env, ch, v.model, learned));
+      // 這句不含上游身分（沒有提供商名稱、網址、原始錯誤），會員看得到全文
+      return json(
+        {
+          error: "too-many-images",
+          hint:
+            "這個模型一次只看得懂 " + learned + " 張圖（已自動記住）— 請移除多餘的圖片再送一次，或換一個模型",
+          conv: convId
+        },
+        400
+      );
+    }
     if (!isAdm) return json({ error: "upstream-error", hint: safeHint(resp.status), conv: convId }, 502);
     return json(
       { error: "upstream-error", hint: "上游回應 " + resp.status, conv: convId, detail: detail },

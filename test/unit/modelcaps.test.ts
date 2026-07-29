@@ -4,7 +4,15 @@
 // {"error":"At most 1 image(s) may be provided in one prompt."}，而站上寫死 4 張。
 // 所以測試的重點放在「數字有沒有被正確地往下砍」與「問不到的時候會不會亂猜」。
 import { describe, it, expect } from "vitest";
-import { parseCaps, capVision, maxImagesFor, seesImagesFor, pickCaps } from "../../src/lib/modelcaps.js";
+import {
+  parseCaps,
+  parseCapsBlob,
+  capVision,
+  maxImagesFor,
+  seesImagesFor,
+  pickCaps,
+  imgLimitFromError
+} from "../../src/lib/modelcaps.js";
 import { PG_LIMITS } from "../../src/lib/playground.js";
 
 describe("parseCaps（快取欄位解析）", () => {
@@ -24,6 +32,53 @@ describe("parseCaps（快取欄位解析）", () => {
 
   it("負數與非數字丟掉", () => {
     expect(parseCaps({ model_caps: '{"a":-1,"b":"x","c":3}' })).toEqual({ c: 3 });
+  });
+});
+
+describe("adv／seen 兩份數字（2026-07-29：Venice 宣稱的會騙人）", () => {
+  it("讀得懂 v2.4.1 初版的扁平格式（線上已有這種資料，不能當壞資料丟掉）", () => {
+    const b = parseCapsBlob({ model_caps: '{"a":10,"b":0}' });
+    expect(b.adv).toEqual({ a: 10, b: 0 });
+    expect(b.seen).toEqual({});
+  });
+
+  it("讀得懂新格式", () => {
+    const b = parseCapsBlob({ model_caps: '{"adv":{"a":10},"seen":{"a":1}}' });
+    expect(b.adv).toEqual({ a: 10 });
+    expect(b.seen).toEqual({ a: 1 });
+  });
+
+  it("實際撞出來的 seen 壓過宣稱的 adv —— 這就是 google-gemma-4-31b-it 那一款", () => {
+    // 宣稱 10、實際只吃 1
+    const ch = { model_caps: '{"adv":{"m":10},"seen":{"m":1}}' };
+    expect(maxImagesFor(ch, "m")).toBe(1);
+  });
+
+  it("seed ≥ 1 也算「看得了圖」（上游肯收就是會看，比宣稱更有說服力）", () => {
+    expect(capVision({ model_caps: '{"adv":{},"seen":{"m":1}}' }, "m")).toBe(true);
+    expect(seesImagesFor({ model_caps: '{"adv":{},"seen":{"m":1}}', vision_models: "" }, "m")).toBe(true);
+  });
+});
+
+describe("imgLimitFromError（從 400 學回真正的上限）", () => {
+  it("認得 Venice 的講法", () => {
+    expect(
+      imgLimitFromError('{"error":"At most 1 image(s) may be provided in one prompt. (parameter=image)"}')
+    ).toBe(1);
+    expect(imgLimitFromError("At most 5 images may be provided")).toBe(5);
+    expect(imgLimitFromError("at  most  20  image")).toBe(20); // 空白寬鬆
+  });
+
+  it("跟張數無關的錯誤一律不學（絕大多數 400 都是別的原因）", () => {
+    expect(imgLimitFromError('{"error":"Image content is not supported by this model."}')).toBe(null);
+    expect(imgLimitFromError("invalid api key")).toBe(null);
+    expect(imgLimitFromError("")).toBe(null);
+    expect(imgLimitFromError(null)).toBe(null);
+  });
+
+  it("不合理的數字當雜訊丟掉", () => {
+    expect(imgLimitFromError("At most 0 image")).toBe(null); // 0＝不支援圖片，走另一條訊息
+    expect(imgLimitFromError("At most 99999 image")).toBe(null);
   });
 });
 

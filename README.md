@@ -132,7 +132,7 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 
 ## Engineering evidence (v2.4.1)
 
-- **533 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
+- **542 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced
