@@ -25,9 +25,33 @@ const PAGE_CSS = `
   .chlist .rowline .t2 code{font-size:11.5px}
   .tag{font-size:10.5px;font-weight:700;border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
   .mrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
-  .mchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:7px;padding:4px 9px;font-size:12px;font-weight:600;cursor:pointer;font-family:ui-monospace,Menlo,Consolas,monospace;transition:.15s}
+  /* 模型複製鈕。文字一律不換行 —— 讓長模型名撐成兩行會使同一排的晶片高矮不一，
+     手機上尤其醜（2026-07-29 站長截圖回報）。塞不下就靠 min-width:0＋ellipsis 截斷，
+     反正點下去複製的是完整名稱，title 也有全名。 */
+  .mchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:7px;padding:4px 9px;font-size:12px;font-weight:600;cursor:pointer;font-family:ui-monospace,Menlo,Consolas,monospace;transition:.15s;max-width:100%;min-width:0}
   .mchip:hover{border-color:var(--line2)}
-  .mchip .cp{opacity:.55;font-family:inherit}
+  .mchip .mn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .mchip .cp{opacity:.55;font-family:inherit;flex:0 0 auto}
+  /* 手機：一顆一行、等寬對齊，模型名靠左、複製圖示靠右 —— 比擠成不等寬的兩排好讀 */
+  @media(max-width:560px){
+    .mrow{flex-direction:column;align-items:stretch}
+    .mchip{justify-content:space-between}
+  }
+  /* 管道列的按鈕組（↑ ↓ 停用 編輯 刪除） */
+  .rowline .acts{display:flex;gap:6px;flex-wrap:wrap;flex:0 0 auto}
+  /* 手機：整列改直向 —— 第一行資訊、第二行按鈕。
+     橫向排時五顆按鈕會把左邊的文字欄壓到只剩一個字寬（.g 有 min-width:0，
+     會一路被壓縮），整欄變成一個字一行的長條（2026-07-29 站長截圖回報）。 */
+  @media(max-width:560px){
+    .chlist .rowline,.chadmin .rowline{flex-direction:column;align-items:stretch;gap:10px}
+    .chadmin .rowline .acts{width:100%}
+    /* 五顆按鈕等分寬度排成一列。原本讓它們照內容寬度排，結果是 4+1 —— 「刪除」
+       被擠到下一行還撐滿整排，而那種寬度最容易誤按。等分之後每顆 60px，
+       Disable／Enable／Edit／Delete 的字都放得下（實測 390px 視窗）。 */
+    .chadmin .rowline .acts .btn{flex:1 1 0;min-width:0;padding-left:6px;padding-right:6px}
+    /* 「可用管道」那列只有一顆「複製網址」，讓它撐滿比縮在右邊好按 */
+    .chlist .rowline>.btn{width:100%}
+  }
   .field textarea{width:100%;border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:8px;padding:10px 11px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.7;outline:none;box-sizing:border-box;resize:vertical}
   .field textarea:focus{border-color:var(--line2)}
   .egtabs{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
@@ -171,9 +195,10 @@ const RELAY_JS = `
           var mr=el("div","mrow");
           c.models.forEach(function(m){
             var chip=el("button","mchip");
-            chip.appendChild(document.createTextNode(m));
+            chip.appendChild(el("span","mn",m));   /* 名稱獨立一格才好做「不換行＋截斷」 */
             chip.appendChild(el("span","cp","⧉"));
-            chip.title=tx("複製模型名稱","Copy model name");
+            /* 名稱太長被截斷時，title 仍看得到完整的 */
+            chip.title=m+" — "+tx("點一下複製","click to copy");
             MU.copyBtn(chip,m);
             mr.appendChild(chip);
           });
@@ -233,7 +258,7 @@ const RELAY_JS = `
     var h=el("h2");h.appendChild(document.createTextNode(tx("管道管理（管理員）","Channels admin")));
     var add=el("button","btn pri",tx("＋ 新增","＋ Add"));
     h.appendChild(add);card.appendChild(h);
-    var box=el("div");card.appendChild(box);
+    var box=el("div","chadmin");card.appendChild(box);
     reloadAdmin(box);
     add.addEventListener("click",function(){editChannel(null,box);});
     return card;
@@ -283,8 +308,12 @@ const RELAY_JS = `
           if(!confirm(tx("刪除管道「"+c.name+"」？","Delete channel?")))return;
           api("/api/admin/relay/channels/"+c.id,{method:"DELETE"}).then(function(){reloadAdmin(box);MU.flash(tx("已刪除","Deleted"));}).catch(function(e){MU.flash(esc(e.message||e));});
         });
-        row.appendChild(up);row.appendChild(dn);
-        row.appendChild(tg);row.appendChild(ed);row.appendChild(del);
+        /* 按鈕包成一組。不包的話它們是 .rowline 的直接子元素，
+           手機版把 .rowline 改成直向堆疊時，五顆鈕會各自佔一整行。 */
+        var acts=el("div","acts");
+        acts.appendChild(up);acts.appendChild(dn);
+        acts.appendChild(tg);acts.appendChild(ed);acts.appendChild(del);
+        row.appendChild(acts);
         box.appendChild(row);
       });
     }).catch(function(e){box.innerHTML='<p class="muted">'+esc(e.message||e)+'</p>';});
