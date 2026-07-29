@@ -36,6 +36,9 @@
     TEXT_SET[e] = 1;
   });
   var OFFICE = { docx: 1, xlsx: 1, pptx: 1 };
+  // PDF 一次最多讀幾頁。不是怕慢，是怕「一份 300 頁的年報」把整個對話的上下文吃光 ——
+  // 讀不完的部分會在結尾標明，使用者知道自己只給了模型前面幾頁。
+  var MAX_PDF_PAGES = 50;
 
   function ext(name) {
     var s = String(name || "");
@@ -240,6 +243,67 @@
     return text;
   }
 
+  /* ================= PDF ================= */
+  // pdf.js 是這個功能裡唯一的第三方相依，而且很大（主檔 500KB ＋ worker 1.3MB）——
+  // 所以**只有使用者真的丟 PDF 進來時**才動態載入。一般聊天、傳圖、丟 Word 都不會付這個成本。
+  // 載一次就快取在 pdfjsP，同一個分頁再丟第二份 PDF 不會重下載。
+  //
+  // 為什麼 PDF 要用第三方而 Office 不用：docx/xlsx/pptx 是 ZIP+XML，文字就明擺在 XML 裡；
+  // PDF 的文字卻是「畫」上去的一堆帶座標的字元，還牽涉字型編碼與 CMap 對照表 ——
+  // 自己解對中文 PDF 幾乎必然出錯，這種地方不該手寫。
+  var pdfjsP = null;
+  function loadPdfjs() {
+    if (!pdfjsP) {
+      var cfg = window.__PDFJS || { main: "/assets/pdf.js", worker: "/assets/pdf.worker.js" };
+      pdfjsP = import(cfg.main).then(function (mod) {
+        mod.GlobalWorkerOptions.workerSrc = cfg.worker;
+        return mod;
+      });
+    }
+    return pdfjsP;
+  }
+
+  async function pdfText(file) {
+    var pdfjs = await loadPdfjs();
+    var buf = await file.arrayBuffer();
+    var doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+    var total = doc.numPages; // 先存起來 —— destroy 之後就讀不到了
+    var pages = Math.min(total, MAX_PDF_PAGES);
+    var out = [];
+    try {
+      for (var i = 1; i <= pages; i++) {
+        var page = await doc.getPage(i);
+        var tc = await page.getTextContent();
+        // pdf.js 給的是一串帶座標的片段，hasEOL 才是換行的依據（照座標自己算行會很脆）
+        var lines = [];
+        var line = "";
+        for (var j = 0; j < tc.items.length; j++) {
+          var it = tc.items[j];
+          if (typeof it.str === "string") line += it.str;
+          if (it.hasEOL) {
+            lines.push(line);
+            line = "";
+          }
+        }
+        if (line) lines.push(line);
+        var text = lines.join("\n").trim();
+        if (text) out.push(total > 1 ? "--- 第 " + i + " 頁 ---\n" + text : text);
+      }
+    } finally {
+      try {
+        doc.destroy();
+      } catch (e) {}
+    }
+    if (!out.length) {
+      // 掃描件／整頁都是圖的 PDF 抽不到任何東西。這時給一句能照做的話，
+      // 不要只說「失敗」—— 使用者需要知道這不是壞掉，而是這份檔案本來就沒有文字。
+      throw new Error("這份 PDF 沒有文字層（多半是掃描件或整頁圖片）— 可以改用截圖當圖片附上");
+    }
+    var s = out.join("\n\n");
+    if (total > pages) s += "\n\n…（全文共 " + total + " 頁，只讀了前 " + pages + " 頁）";
+    return s;
+  }
+
   /* ================= 純文字檔 ================= */
   async function plainText(file) {
     var buf = await file.arrayBuffer();
@@ -372,15 +436,22 @@
     },
     isDoc: function (file) {
       var e = ext(file.name);
-      return !!(TEXT_SET[e] || OFFICE[e]);
+      return !!(TEXT_SET[e] || OFFICE[e] || e === "pdf");
     },
     isOffice: function (file) {
       return !!OFFICE[ext(file.name)];
     },
+    isPdf: function (file) {
+      return ext(file.name) === "pdf";
+    },
+    // pdf.js 是不是已經載進來了 —— 給 UI 判斷要不要先提示「第一次要下載解析器」
+    pdfReady: function () {
+      return !!pdfjsP;
+    },
     // 給 <input accept> 用
     acceptImage: "image/jpeg,image/png,image/webp,image/gif",
     acceptDoc:
-      ".docx,.xlsx,.pptx," +
+      ".pdf,.docx,.xlsx,.pptx," +
       TEXT_EXT.split(",")
         .map(function (e) {
           return "." + e;
@@ -390,7 +461,8 @@
     upload: upload,
     // 文件 → 純文字（含截斷標記）
     toText: async function (file) {
-      var text = OFFICE[ext(file.name)] ? await officeText(file) : await plainText(file);
+      var e = ext(file.name);
+      var text = e === "pdf" ? await pdfText(file) : OFFICE[e] ? await officeText(file) : await plainText(file);
       var cut = false;
       if (text.length > MAX_TEXT) {
         text = text.slice(0, MAX_TEXT);

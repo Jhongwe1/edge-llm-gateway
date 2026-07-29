@@ -15,7 +15,7 @@ export const VERSION = "2.3.0"; // 站台版本（/api/health 回報；發佈時
 // 收斂前同時存在 account.js?v=20260717b、logs.js?v=20260721，以及 admin.js／marked.js
 // 「根本沒帶」三種狀態 —— 後者等於那兩支的更新永遠要等快取自然過期。
 // 一個常數、一個 assetSrc()，這一整類問題就不會再發生。
-export const ASSET_V = "20260729a";
+export const ASSET_V = "20260729b";
 export function assetSrc(file: string): string {
   return "/assets/" + file + "?v=" + ASSET_V;
 }

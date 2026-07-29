@@ -32,7 +32,10 @@ const PG_CSS = `
   .pg-msgs::-webkit-scrollbar-track{background:transparent}
   .pg-msgs::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px;border:2px solid transparent;background-clip:content-box}
   .m{width:100%;max-width:760px;margin:0 auto;flex:0 0 auto}
-  .m.user{display:flex;justify-content:flex-end}
+  /* 直向堆疊：附件在上、文字氣泡在下，整組靠右（跟主流聊天介面一致）。
+     ⚠ 這裡一定要 column —— 用 row 的話附件列與氣泡會變成左右並排，
+     送出一張圖加一句話就會看到「圖在左、字在右」的怪版面（2026-07-29 上線後才發現）。 */
+  .m.user{display:flex;flex-direction:column;align-items:flex-end}
   /* 使用者訊息：ChatGPT 式灰底氣泡（不再用反色） */
   .mb-user{background:var(--field);color:var(--fg);border-radius:18px;padding:10px 16px;max-width:84%;
            font-size:15px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -137,8 +140,8 @@ const PG_CSS = `
   .pg-att.busy{opacity:.55}
   /* 拖放整個聊天區時的提示框 */
   .pg.drop{outline:2px dashed var(--accent);outline-offset:-10px;border-radius:12px}
-  /* 訊息氣泡裡的附件（使用者訊息，圖片在文字上方） */
-  .m-atts{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin-bottom:6px}
+  /* 訊息氣泡裡的附件（使用者訊息，圖片在文字上方、跟氣泡一樣靠右對齊） */
+  .m-atts{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin-bottom:6px;max-width:84%}
   .m-atts img{max-width:220px;max-height:220px;border-radius:12px;display:block;cursor:zoom-in;
               border:1px solid var(--line)}
   /* 內容被淘汰／過期清掉的附件：中繼資料還在，畫成佔位而不是破圖 */
@@ -174,7 +177,14 @@ export async function playgroundPageResponse(env: Env, request: Request): Promis
     '<script data-nonce src="' +
     assetSrc("marked.js") +
     '"></script>\n' +
-    // 附件處理（圖片壓縮、Office 抽文字、上傳）。只有這一頁需要，其他頁不載。
+    // pdf.js 的資產路徑（帶快取版本）。pgattach.js 只有在使用者真的丟 PDF 進來時
+    // 才會動態 import 這兩個檔案 —— 它們合計 1.8MB，不能讓每個進聊天頁的人都下載。
+    '<script data-nonce>window.__PDFJS={main:"' +
+    assetSrc("pdf.js") +
+    '",worker:"' +
+    assetSrc("pdf.worker.js") +
+    '"};</script>\n' +
+    // 附件處理（圖片壓縮、Office／PDF 抽文字、上傳）。只有這一頁需要，其他頁不載。
     '<script data-nonce src="' +
     assetSrc("pgattach.js") +
     '"></script>\n' +
@@ -587,6 +597,9 @@ const PG_JS = `
           MU.flash(esc(e.message||e));
         });
       }else if(PGA.isDoc(f)){
+        /* 第一次讀 PDF 要先下載 1.8MB 的解析器，慢網路可能等好幾秒 —— 先講一聲，
+           不然附件晶片就只是卡在「處理中…」，看起來像當掉了。 */
+        if(PGA.isPdf(f)&&!PGA.pdfReady())MU.flash(tx("首次讀取 PDF 需要先下載解析器…","Loading PDF parser…"));
         var pd={kind:"doc",name:f.name,bytes:f.size,busy:true,text:""};
         atts.push(pd);renderAtts();
         PGA.toText(f).then(function(r){

@@ -497,13 +497,20 @@ Authorization: Bearer uak-你的金鑰
 
 ### 附件（2026-07-29 v2.3.0）
 
-聊天可以附**圖片**（給看得懂圖的模型看）與**文件**（docx/xlsx/pptx/txt/csv/程式碼…）。兩者走完全不同的路：
+聊天可以附**圖片**（給看得懂圖的模型看）與**文件**（PDF/docx/xlsx/pptx/txt/csv/程式碼…）。兩者走完全不同的路：
 
 | | 圖片 | 文件 |
 |---|---|---|
 | 怎麼送 | 先上傳成一筆檔案，訊息帶 `files:[編號]` | **在瀏覽器就抽成純文字**，直接併進 `content` |
 | 需要模型支援 vision | 是 | **否**（純文字模型也能「讀」Word 檔） |
 | 佔儲存空間 | 是 | 否 |
+
+文件在瀏覽器端解析，伺服器完全不經手：
+- **PDF** → `pdf.js`（vendored 在 `public/assets/pdf.js`＋worker，合計 1.8MB，**只有真的丟 PDF 進來才動態載入**）。一次最多讀 50 頁，超過的在結尾標明。**掃描件／整頁都是圖的 PDF 沒有文字層**，會明確告訴使用者「可以改用截圖當圖片附上」，而不是丟一句失敗。
+- **docx/xlsx/pptx** → 三種都是 ZIP+XML，用瀏覽器原生的 `DecompressionStream('deflate-raw')`＋`DOMParser` 自己解，**沒有引任何相依套件**。代價是格式扁平化（表格變 Tab 分隔、標題層級消失）——對「餵給模型讀」這個用途，文字在就夠了。
+- **純文字類** → 先照 UTF-8 解，出現替代字元就改用 Big5 再試（台灣的舊 .txt/.csv 很多是 Big5，直接當 UTF-8 讀會整篇亂碼）。
+
+單一文件抽出來的文字上限 40,000 字，超過截斷並在結尾標明（悄悄砍掉會讓模型以為自己讀完了）。
 
 - `POST /api/playground/files?mime=image/webp&name=a.webp&w=800&h=600` → `{ id, mime, name, bytes, w, h }`
   - **本體直接是 base64 字串**（`Content-Type: text/plain`），不是 JSON、也不是二進位。這是為了 CPU：三家上游都只吃 base64，收二進位的話每次對話都要 `btoa` 編一次（1MB 圖 8.11ms，而免費方案每請求只有 10ms），包成 JSON 則是 `JSON.parse` 要逐字元掃過整段 base64（比 raw 慢 4.7 倍）。收 base64 原字串等於「瀏覽器編好、伺服器原封轉手」，全程不編不解。
