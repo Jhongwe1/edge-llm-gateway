@@ -47,6 +47,15 @@ const PAGE_CSS = `
   .mini.danger:hover{border-color:#c33;color:#c33}
   .chip{display:inline-block;font-size:10.5px;font-weight:700;border-radius:20px;padding:2px 9px;border:1px solid var(--line);color:var(--muted);vertical-align:1px}
   .chip.pub{background:var(--accent);color:var(--accent-fg);border-color:var(--line2)}
+  /* 附件儲存（唯讀狀態磚） */
+  .stogrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px}
+  .stobox{border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+  .stobox .k{font-size:11px;color:var(--muted);font-weight:700;letter-spacing:.04em}
+  .stobox .v{font-size:15px;font-weight:700;margin-top:3px;word-break:break-word}
+  .stobox .s{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.55}
+  .meter{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:8px}
+  .meter i{display:block;height:100%;background:var(--accent);border-radius:3px}
+  .meter.warn i{background:#c93}
   /* 管理捷徑 */
   .quick{display:flex;gap:8px;flex-wrap:wrap}
   /* 頁面編輯彈窗的內文欄 */
@@ -204,6 +213,13 @@ const BODY = `
       </div>
     </div>
     <div class="saverow"><button id="saveQuota" class="primary" type="button">儲存</button><span id="msgQuota" class="savemsg"></span></div>
+  </div>
+
+  <!-- 附件儲存（唯讀） -->
+  <div class="card">
+    <div class="card-title">附件儲存</div>
+    <p class="hint">聊天附件（圖片）存在哪、還剩多少。<b>這張卡只顯示現況，不能在這裡改</b> — 三層容量要調請用 API（<code>PUT /api/admin/settings</code> 的 <code>pgfile_max_kb</code>／<code>pgfile_user_mb</code>／<code>pgfile_total_mb</code>），而且只能往下調：上限寫死在程式裡，免得手滑越過 Cloudflare 免費額度。</p>
+    <div id="stoBox"></div>
   </div>
 
   <!-- 中轉計量 -->
@@ -372,8 +388,67 @@ const PAGE_JS = `
       $(p[0]).placeholder=D[p[1]]==null?"":(D[p[1]]>0?("內建預設 "+D[p[1]]):"不限");
     });
     fillTg();
+    renderStorage();
     renderPrices();
     renderPages();
+  }
+
+  /* 附件儲存卡 —— 刻意做成唯讀（2026-07-30 站長拍板）。
+     三層容量的天花板跟著儲存模式變（純 D1 1464KB／R2 10MB…），做成輸入框就得把
+     「為什麼打 8192 會被擋」整套解釋塞進 UI；而那幾個數字一年動不到一次，
+     真正每個月想看一眼的是「免費額度用到哪了」。所以這裡只顯示，改值走 API。 */
+  function tile(k,v,sub,pct){
+    var d=document.createElement("div");d.className="stobox";
+    var a=document.createElement("div");a.className="k";a.textContent=k;d.appendChild(a);
+    var b=document.createElement("div");b.className="v";b.textContent=v;d.appendChild(b);
+    if(sub){var c=document.createElement("div");c.className="s";c.textContent=sub;d.appendChild(c);}
+    if(pct!=null&&isFinite(pct)){
+      var m=document.createElement("div");m.className="meter"+(pct>=80?" warn":"");
+      var i=document.createElement("i");
+      /* 至少 2% 才畫得出來 —— 0% 的空條看起來像壞掉，而不是「還沒用」 */
+      i.style.width=Math.max(2,Math.min(100,pct))+"%";
+      m.appendChild(i);d.appendChild(m);
+    }
+    return d;
+  }
+  /* 千分位 —— 900000 跟 9000000 用肉眼分不出差一個零，而這兩個數字就差 10 倍 */
+  function num(n){return String(n).replace(/\\B(?=(\\d{3})+(?!\\d))/g,",");}
+  function kbTxt(kb){return kb>=1024?((Math.round(kb/102.4)/10)+"MB"):(kb+"KB");}
+  function mbTxt(mb){return mb>=1024?((Math.round(mb/102.4)/10)+"GB"):(mb+"MB");}
+  function renderStorage(){
+    var box=$("stoBox");if(!box)return;
+    box.textContent="";
+    var s=st&&st.storage;
+    if(!s){box.appendChild(document.createTextNode("（讀不到儲存資訊）"));return;}
+    var r2=s.mode==="r2",L=s.limits||{},u=s.used||{},o=s.ops||{},F=s.free||{},P=s.plan||{};
+    var g=document.createElement("div");g.className="stogrid";
+
+    g.appendChild(tile("儲存模式",r2?"R2":"純 D1",
+      r2?"內容存 R2 桶，D1 只留中繼資料與鍵名":"內容存 D1 的 b64 欄位（沒有 R2 綁定）"));
+    g.appendChild(tile("單檔上限",kbTxt(L.maxKb||0),
+      st.pgfile_max_kb==null?"內建預設":"已自訂（內建 "+kbTxt((st.defaults||{}).pgfile_max_kb||0)+"）"));
+    g.appendChild(tile("每人上限",mbTxt(L.userMb||0),st.pgfile_user_mb==null?"內建預設":"已自訂"));
+    g.appendChild(tile("全站上限",mbTxt(L.totalMb||0),
+      (u.filesRawMb!=null?("已用 "+mbTxt(u.filesRawMb)+"（原始大小）"):"")+
+      (r2?" · 等於 R2 裡的 "+mbTxt(Math.ceil((L.totalMb||0)*4/3))+"（base64 脹 4/3）":""),
+      L.totalMb?Math.round(((u.filesRawMb||0)/L.totalMb)*100):null));
+
+    if(r2){
+      g.appendChild(tile("R2 空間",mbTxt(u.r2TotalMb||0)+" / "+mbTxt(F.storageMb||0),
+        "附件 "+mbTxt(u.r2FilesMb||0)+" · 備份 "+(u.backupMb==null?"待每日排程量測":mbTxt(u.backupMb)),
+        u.r2Pct));
+      g.appendChild(tile("本月寫入 (Class A)",num(o.a||0)+" 次",
+        "預算 "+num(P.classA||0)+" / 免費額度 "+num(F.classA||0)+"。用完新檔自動改存 D1",o.aPct));
+      g.appendChild(tile("本月讀取 (Class B)",num(o.b||0)+" 次",
+        "預算 "+num(P.classB||0)+" / 免費額度 "+num(F.classB||0)+"。用完舊圖顯示佔位",o.bPct));
+    }
+    box.appendChild(g);
+
+    var n=document.createElement("p");n.className="hint";n.style.marginBottom="0";n.style.marginTop="12px";
+    n.textContent=r2
+      ?"任一項到 80% 會寫 errlog、由 Telegram 告警帶出來。每日排程會量真實用量再從最舊的附件開始回收，所以這幾條線是自己會收斂的。"
+      :"綁上 R2（wrangler.toml 的 FILES）就會切到 R2 模式，單檔上限自動放寬到 5MB；舊檔照樣讀得到，不必搬資料。";
+    box.appendChild(n);
   }
   // Telegram 卡：token 只顯示遮罩提示（明文伺服器不回）；欄位留空＝保留現值
   function fillTg(){

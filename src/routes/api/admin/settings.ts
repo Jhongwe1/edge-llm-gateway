@@ -33,8 +33,8 @@ import { adminOk, pgOpenAll } from "../../../lib/auth.js";
 import { QUOTA_DEFAULTS } from "../../../lib/quota.js";
 import { DEMO_DEFAULTS, demoCfg } from "../../../lib/demo.js";
 import { PG_DEFAULT_SYSTEM } from "../../../lib/playground.js";
-import { FILE_DEFAULTS, FILE_CEILING, activeStore } from "../../../lib/filestore.js";
-import { R2_FREE, R2_PLAN, r2Ops } from "../../../lib/r2budget.js";
+import { FILE_DEFAULTS, FILE_CEILING, activeStore, fileLimits } from "../../../lib/filestore.js";
+import { R2_FREE, R2_PLAN, r2Ops, r2MbFromRawMb } from "../../../lib/r2budget.js";
 import { audit } from "../../../lib/observe.js";
 import type { RouteCtx } from "../../../types.js";
 
@@ -79,6 +79,51 @@ function tgHint(v: string | undefined): string {
   return v ? "…" + v.slice(-4) : "";
 }
 
+/**
+ * 附件的真實用量（/settings 的「附件儲存」卡拿去顯示）。
+ *
+ * 兩個數字刻意分開回，因為它們量的是不同的東西：
+ *   filesRawMb — 全部未清除附件的**原始檔大小**合計。這把尺要跟 pgfile_total_mb 一致，
+ *                也要跟 cron 淘汰時比對的那個 SUM 一致，所以不分 d1／r2 全算進來。
+ *   r2FilesMb  — 只算存在 R2 的那些，再乘 4/3 還原成 base64 的**實際佔用**。
+ *                這才是拿去跟 10GB 免費額度比的數字。
+ * 兩者用同一次查詢取得（CASE WHEN），不為了一張唯讀卡多打一趟 D1。
+ *
+ * backupRaw＝settings 的 r2_backup_mb（每日 cron 量完寫進去的）。cron 還沒跑過就是
+ * null，UI 顯示「待每日排程量測」而不是假裝它是 0 —— 0 會讓人以為備份不佔空間。
+ */
+async function storageUsed(
+  env: RouteCtx["env"],
+  store: "d1" | "r2",
+  backupRaw: string | undefined
+): Promise<Record<string, number | null>> {
+  let allBytes = 0;
+  let r2Bytes = 0;
+  try {
+    const r = await env.DB.prepare(
+      "SELECT COALESCE(SUM(bytes),0) AS a, " +
+        "COALESCE(SUM(CASE WHEN storage='r2' THEN bytes ELSE 0 END),0) AS r " +
+        "FROM pg_files WHERE purged=0"
+    ).first<{ a: number; r: number }>();
+    allBytes = Number(r && r.a) || 0;
+    r2Bytes = Number(r && r.r) || 0;
+  } catch (e) {}
+  const filesRawMb = Math.ceil(allBytes / 1048576);
+  if (store !== "r2")
+    return { filesRawMb: filesRawMb, r2FilesMb: null, backupMb: null, r2TotalMb: null, r2Pct: null };
+  const r2FilesMb = r2MbFromRawMb(Math.ceil(r2Bytes / 1048576));
+  const b = parseInt(backupRaw || "", 10);
+  const backupMb = Number.isFinite(b) ? b : null;
+  const r2TotalMb = r2FilesMb + (backupMb || 0);
+  return {
+    filesRawMb: filesRawMb,
+    r2FilesMb: r2FilesMb,
+    backupMb: backupMb,
+    r2TotalMb: r2TotalMb,
+    r2Pct: Math.round((r2TotalMb / R2_FREE.storageMb) * 100)
+  };
+}
+
 // 設定表目前的原況（給 /settings 管理頁當編輯初值）。數字鍵沒設過＝null；
 // 前端拿 defaults 當 placeholder，空欄送 null＝清掉覆寫、回到內建預設。
 export async function onRequestGet(context: RouteCtx): Promise<Response> {
@@ -93,7 +138,7 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
         "'quota_relay_day','quota_pg_day','rl_per_min','tg_bot_token','tg_chat_id'," +
         "'demo_mode','demo_channel','demo_models','demo_per_min','demo_per_ip_day','demo_global_day','demo_max_tokens'," +
         "'dumb_mode','dumb_channel','dumb_model','vpn_public'," +
-        "'pgfile_max_kb','pgfile_user_mb','pgfile_total_mb')"
+        "'pgfile_max_kb','pgfile_user_mb','pgfile_total_mb','r2_backup_mb')"
     ).all();
     const st: Record<string, string> = {};
     ((res.results || []) as { k: string; v: string }[]).forEach(function (r) {
@@ -167,7 +212,13 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
         ceiling: FILE_CEILING[store],
         free: R2_FREE,
         plan: R2_PLAN,
-        ops: store === "r2" ? await r2Ops(env, true) : null
+        ops: store === "r2" ? await r2Ops(env, true) : null,
+        // limits＝**現在真正生效**的三層容量（內建預設 → settings 覆寫 → 天花板夾擠之後）。
+        // 跟上面那三個 pgfile_* 原況欄位不一樣：那些是「有沒有設過」，這個是「實際擋在哪」。
+        limits: await fileLimits(env),
+        // used＝真實用量。filesRawMb 跟 pgfile_total_mb 是同一把尺（原始檔大小，
+        // 也是 cron 淘汰時比對的那個數）；r2FilesMb 才是 R2 實際佔用（base64 的 4/3）。
+        used: await storageUsed(env, store, st.r2_backup_mb)
       }
     });
   } catch (e: any) {

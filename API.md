@@ -267,7 +267,19 @@ curl -X PUT https://uaip.cc.cd/api/admin/menu ^
 
 **GET**（2026-07-17，/settings 管理頁的數據源）回目前**存的**原況：`{ ok, brand, custom, contact_url, pg_open, pg_default_system, relay_meter, quota_relay_day, quota_pg_day, rl_per_min, demo_mode, demo_active, demo_channel, demo_models, demo_per_min, demo_per_ip_day, demo_global_day, demo_max_tokens, pgfile_max_kb, pgfile_user_mb, pgfile_total_mb, tg_chat_id, tg_token_set, tg_token_hint, tg_env_set, tg_active, defaults, storage }` — 數字鍵沒設過回 `null`（不是內建預設值），內建預設放在 `defaults` 物件；`demo_mode` 是開關本身的儲存值、`demo_active` 才是真正生效與否（開關＋`demo_channel` 都要有）；Telegram bot token **絕不回明文**（只回 `tg_token_set` 與尾 4 碼 `tg_token_hint`）。
 
-`storage`（2026-07-30 v2.4.0）回附件儲存的現況：`{ mode, ceiling, free, plan, ops }` — `mode` 是 `d1` 或 `r2`（由有沒有綁 R2 決定，不是設定值）、`ceiling` 是這個模式下三個 `pgfile_*` 各自能填到多大、`free` 是 Cloudflare R2 免費額度的原始數字、`plan` 是我們自訂的預算（永遠訂在免費額度以下）、`ops` 是本月 R2 操作用量（只有 `r2` 模式才有，`null` 表示純 D1）。
+`storage`（2026-07-30 v2.4.0）回附件儲存的現況，`/settings` 的「附件儲存」卡整張就是畫這塊：`{ mode, ceiling, free, plan, ops, limits, used }`
+
+| 欄位 | 內容 |
+|---|---|
+| `mode` | `d1` 或 `r2` — 由**有沒有綁 R2**（`wrangler.toml` 的 `FILES`）決定，不是設定值，改不了 |
+| `ceiling` | 這個模式下三個 `pgfile_*` 各自最多能填到多大（程式寫死） |
+| `free` | Cloudflare R2 免費額度的原始數字（`storageMb` / `classA` / `classB`） |
+| `plan` | 我們自訂的預算，永遠訂在 `free` 以下（空間分配、操作次數、告警百分比） |
+| `ops` | 本月 R2 操作用量 `{ month, a, b, aPct, bPct, aOk, bOk }`；純 D1 模式回 `null` |
+| `limits` | **現在真正生效**的三層容量（內建預設 → settings 覆寫 → 天花板夾擠之後）。跟上面 `pgfile_*` 那三個欄位不同：那些回答「有沒有設過」，這個回答「實際擋在哪」 |
+| `used` | 真實用量 `{ filesRawMb, r2FilesMb, backupMb, r2TotalMb, r2Pct }`。`filesRawMb` 是**原始檔大小**合計（跟 `pgfile_total_mb` 和 cron 淘汰用的是同一把尺，兩種模式都有）；`r2FilesMb` 才是 R2 **實際佔用**（base64 的 4/3）。純 D1 模式下 R2 專屬的欄位是 `null` 而不是 `0` |
+
+`used.backupMb` 由每日 cron 量測後寫進 settings 的 `r2_backup_mb`；cron 還沒跑過就是 `null`（不是 0）。
 
 **PUT：本體帶哪個鍵就改哪個鍵，沒帶的不動**（2026-07-14 起；跟文章／選單的整包覆蓋不同）。回 `{ ok, brand, custom, contact_url, pg_open, pg_default_system, quota_relay_day, quota_pg_day, rl_per_min, relay_meter, demo_* }`（改完的現況；配額鍵沒設過時顯示內建預設）。
 

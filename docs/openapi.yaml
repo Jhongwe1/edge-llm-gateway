@@ -492,7 +492,7 @@ paths:
       responses:
         "200":
           {
-            description: "{ ok, brand, custom, contact_url, pg_open, pg_default_system, relay_meter, quota_*, demo_*, demo_active, pgfile_*, defaults, storage }（storage＝{ mode: d1|r2, ceiling, free, plan, ops } 附件儲存現況與本月 R2 用量）"
+            description: "{ ok, brand, custom, contact_url, pg_open, pg_default_system, relay_meter, quota_*, demo_*, demo_active, pgfile_*, defaults, storage }（storage＝{ mode: d1|r2, ceiling, free, plan, ops, limits, used } — 附件儲存模式、天花板、生效中的容量與真實用量，/settings 的「附件儲存」卡就是畫這塊）"
           }
         "401": { $ref: "#/components/responses/Unauthorized" }
     put:

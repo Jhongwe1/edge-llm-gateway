@@ -7,7 +7,10 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
 import { onRequestPost as uploadFile } from "../../src/routes/api/playground/files/index.js";
 import { onRequestGet as getFile } from "../../src/routes/api/playground/files/[id].js";
-import { onRequestPut as putSettings } from "../../src/routes/api/admin/settings.js";
+import {
+  onRequestPut as putSettings,
+  onRequestGet as settingsGet
+} from "../../src/routes/api/admin/settings.js";
 import { createSession } from "../../src/lib/auth.js";
 import { activeStore, fileLimits, uploadPlan, FILE_DEFAULTS, FILE_CEILING } from "../../src/lib/filestore.js";
 import { R2_PLAN, opKeys, resetOpsCache } from "../../src/lib/r2budget.js";
@@ -46,6 +49,10 @@ async function upCtx(user: UserRow, b64: string, useEnv?: Env) {
 }
 
 const approved = () => seedUser({ status: "approved", services: "playground" });
+
+// 管理金鑰走 LOGS_TOKEN（跟其他 admin 端點測試同一套）
+const TOK = "test-admin-token";
+const adminEnv = (useEnv: Env) => Object.assign({}, useEnv, { LOGS_TOKEN: TOK }) as Env;
 
 // 直接把本月的操作計數設成某個值（模擬「額度快用完」）
 async function setOps(cls: "a" | "b", n: number) {
@@ -228,10 +235,6 @@ describe("免費額度守門", () => {
 });
 
 describe("設定天花板 — 管理員不能把額度調到超過免費方案", () => {
-  const TOK = "test-admin-token";
-  // 管理金鑰走 LOGS_TOKEN（跟其他 admin 端點測試同一套）
-  const adminEnv = (useEnv: Env) => Object.assign({}, useEnv, { LOGS_TOKEN: TOK }) as Env;
-
   async function putCtx(useEnv: Env, body: Record<string, unknown>) {
     return makeCtx({
       url: ORIGIN + "/api/admin/settings",
@@ -273,6 +276,55 @@ describe("設定天花板 — 管理員不能把額度調到超過免費方案",
     expect(r.status).toBe(200);
     expect((await fileLimits(r2Env())).totalMb).toBe(1000);
     await env.DB.prepare("DELETE FROM settings WHERE k='pgfile_total_mb'").run();
+  });
+
+  // /settings 的「附件儲存」卡整張都靠這塊資料畫（唯讀）。它壞掉不會有人看到錯誤，
+  // 只會看到一張空卡或錯的數字 —— 而這張卡的用途正是「讓人相信沒有超出免費額度」。
+  it("GET 回 storage：模式、天花板、生效中的容量、真實用量、本月操作", async () => {
+    const u = await approved();
+    await setOps("a", 12);
+    await setOps("b", 34);
+    const ctx = await upCtx(u, fakeWebp(2 * 1048576), r2Env()); // 2MB 進 R2
+    await uploadFile(ctx);
+    await drainWaits(ctx);
+    await env.DB.prepare("INSERT OR REPLACE INTO settings (k,v) VALUES ('r2_backup_mb','7')").run();
+
+    const g = makeCtx({
+      url: ORIGIN + "/api/admin/settings",
+      env: adminEnv(r2Env()),
+      init: { headers: { authorization: "Bearer " + TOK } }
+    });
+    const s = ((await (await settingsGet(g)).json()) as any).storage;
+    await drainWaits(g);
+
+    expect(s.mode).toBe("r2");
+    expect(s.limits.maxKb).toBe(FILE_DEFAULTS.r2.pgfile_max_kb);
+    expect(s.ceiling.pgfile_total_mb).toBe(FILE_CEILING.r2.pgfile_total_mb);
+    expect(s.ops.a).toBe(13); // 12 ＋ 這次上傳的 1
+    expect(s.ops.b).toBe(34);
+    // 用量：原始 2MB；R2 實佔 ×4/3＝3MB；加上備份 7MB＝10MB
+    expect(s.used.filesRawMb).toBe(2);
+    expect(s.used.r2FilesMb).toBe(3);
+    expect(s.used.backupMb).toBe(7);
+    expect(s.used.r2TotalMb).toBe(10);
+    await env.DB.prepare("DELETE FROM settings WHERE k='r2_backup_mb'").run();
+  });
+
+  it("純 D1 模式：storage 也要回得出來，R2 專屬的數字是 null（不是 0）", async () => {
+    const g = makeCtx({
+      url: ORIGIN + "/api/admin/settings",
+      env: adminEnv(env as unknown as Env),
+      init: { headers: { authorization: "Bearer " + TOK } }
+    });
+    const s = ((await (await settingsGet(g)).json()) as any).storage;
+    await drainWaits(g);
+    expect(s.mode).toBe("d1");
+    expect(s.ops).toBeNull();
+    expect(s.limits.maxKb).toBe(FILE_DEFAULTS.d1.pgfile_max_kb);
+    // null 而不是 0 —— 0 會讓卡片畫出「備份不佔空間」這種假訊息
+    expect(s.used.r2FilesMb).toBeNull();
+    expect(s.used.backupMb).toBeNull();
+    expect(typeof s.used.filesRawMb).toBe("number"); // 這個兩種模式都有
   });
 
   it("就算 settings 裡躺著超標的舊值，讀出來也會被夾回天花板", async () => {
