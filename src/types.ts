@@ -11,6 +11,10 @@ export interface Env {
   ASSETS: { fetch: (req: Request) => Promise<Response> };
   RATE_LIMITER?: DurableObjectNamespace<RateLimiter>; // Phase H 限流器 DO（可選：沒綁定就走 D1 降級路徑）
   BACKUPS?: R2Bucket; // Phase I 備份桶（可選：沒綁定＝備份 job 跳過）
+  // v2.3 Playground 附件桶（可選）。**綁定在＝新附件寫 R2，沒綁定＝寫 D1 的 b64 欄位**，
+  // 判斷寫在 lib/filestore.ts activeStore()。每一列各自記自己存在哪（pg_files.storage），
+  // 所以之後開通 R2 不必搬資料、舊檔照樣讀得到。
+  FILES?: R2Bucket;
   SITE_ORIGIN?: string;
   ADMIN_EMAILS?: string;
   LOGS_TOKEN?: string;
@@ -67,6 +71,7 @@ export interface ChannelRow {
   models: string;
   system_prompt: string; // 只給 Playground 注入的系統提示詞；/relay 中轉不讀這欄（migration 0005）
   extra_body: string; // 合併進 playground 上游請求本體的額外參數（JSON 物件字串）；/relay 不讀（migration 0006）
+  vision_models: string; // 這個管道裡「吃得下圖片」的模型（逗號分隔）；空＝都不支援（migration 0007）
   enabled: number;
   created_at: string;
   [key: string]: unknown;

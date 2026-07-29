@@ -116,6 +116,49 @@ const PG_CSS = `
   @media(hover:none){
     .pg-ta{font-size:16px}
   }
+  /* ---- 附件（v2.3）---- */
+  /* 輸入框上方的待送出附件列。整個 .pg-comp 改成直向堆疊：附件列在上、輸入列在下 */
+  .pg-comp{flex-direction:column;align-items:stretch;gap:0}
+  .pg-comp-row{display:flex;align-items:flex-end;gap:4px;width:100%}
+  .pg-atts{display:flex;flex-wrap:wrap;gap:8px;padding:6px 6px 8px}
+  .pg-att{position:relative;display:flex;align-items:center;gap:8px;background:var(--card);
+          border:1px solid var(--line);border-radius:12px;padding:6px 10px 6px 6px;max-width:230px}
+  .pg-att img{width:38px;height:38px;object-fit:cover;border-radius:8px;flex:0 0 auto;display:block}
+  /* 文件附件的方形圖示（顯示副檔名） */
+  .pg-att .fic{width:38px;height:38px;border-radius:8px;flex:0 0 auto;display:flex;align-items:center;
+               justify-content:center;background:var(--field);color:var(--muted);font-size:10px;font-weight:700;
+               text-transform:uppercase;letter-spacing:.02em;overflow:hidden}
+  .pg-att .fm{min-width:0;display:flex;flex-direction:column;gap:2px}
+  .pg-att .fn{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pg-att .fs{font-size:11px;color:var(--muted)}
+  .pg-att .fx{position:absolute;top:-6px;right:-6px;width:20px;height:20px;border-radius:50%;border:0;
+              background:var(--fg);color:var(--bg);font-size:12px;line-height:1;cursor:pointer;
+              display:flex;align-items:center;justify-content:center;font-family:inherit;padding:0}
+  .pg-att.busy{opacity:.55}
+  /* 拖放整個聊天區時的提示框 */
+  .pg.drop{outline:2px dashed var(--accent);outline-offset:-10px;border-radius:12px}
+  /* 訊息氣泡裡的附件（使用者訊息，圖片在文字上方） */
+  .m-atts{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin-bottom:6px}
+  .m-atts img{max-width:220px;max-height:220px;border-radius:12px;display:block;cursor:zoom-in;
+              border:1px solid var(--line)}
+  /* 內容被淘汰／過期清掉的附件：中繼資料還在，畫成佔位而不是破圖 */
+  .m-att-gone{display:flex;align-items:center;gap:7px;background:var(--field);border:1px dashed var(--line2);
+              border-radius:10px;padding:7px 11px;font-size:12px;color:var(--muted)}
+  /* 使用者訊息裡的檔案內容：摺疊起來，不然一個 Excel 抽出來的幾萬字會淹掉整個對話 */
+  .mb-doc{margin-top:8px;border:1px solid var(--line);border-radius:10px;background:var(--bg);overflow:hidden}
+  .mb-doc:first-child{margin-top:0}
+  .mb-doc>summary{cursor:pointer;list-style:none;padding:7px 11px;font-size:12.5px;font-weight:600;
+                  user-select:none;display:flex;align-items:center;gap:6px}
+  .mb-doc>summary::-webkit-details-marker{display:none}
+  .mb-doc-body{padding:0 11px 9px;font-size:12px;line-height:1.7;color:var(--muted);white-space:pre-wrap;
+               overflow-wrap:anywhere;max-height:260px;overflow-y:auto}
+  /* 點縮圖看原圖的燈箱 */
+  .pg-lb{position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:60;display:flex;align-items:center;
+         justify-content:center;padding:24px;cursor:zoom-out}
+  .pg-lb img{max-width:100%;max-height:100%;border-radius:8px}
+  @media(max-width:560px){
+    .m-atts img{max-width:150px;max-height:150px}
+  }
   /* 體驗模式橫幅（Phase K）：未登入＋demo 開時顯示在聊天區頂端 */
   .pg-demo{flex:0 0 auto;max-width:760px;width:calc(100% - 32px);margin:10px auto 0;border:1px solid var(--line);
            background:var(--card);border-radius:12px;padding:9px 14px;font-size:13px;color:var(--muted);line-height:1.7}
@@ -130,6 +173,10 @@ export async function playgroundPageResponse(env: Env, request: Request): Promis
     '<div id="root"><div class="gate"><div class="spin"></div></div></div>\n' +
     '<script data-nonce src="' +
     assetSrc("marked.js") +
+    '"></script>\n' +
+    // 附件處理（圖片壓縮、Office 抽文字、上傳）。只有這一頁需要，其他頁不載。
+    '<script data-nonce src="' +
+    assetSrc("pgattach.js") +
     '"></script>\n' +
     "<script data-nonce>" +
     MEMBER_JS +
@@ -170,6 +217,7 @@ const PG_JS = `
   var me=null,groups=[],cur=null,msgs=[];
   var demoMode=false;  // 體驗模式（未登入＋管理員開 demo）：無歷史（對話只有管理員看得到）
   var dumbMode=false;  // Dumb mode（v2.2）：模型被管理員鎖定且隱藏 — 沒有模型選單、送出不帶模型
+  var dumbVision=false;// dumb 模式下前端不知道模型是誰，只由伺服器告知「能不能附圖」
   var streaming=false,aborter=null;
   var UI={};
   var model="";        // 目前選的模型（"channelSlug|modelName"）
@@ -241,13 +289,14 @@ const PG_JS = `
           if(!s.demo){paint();return;}
           demoMode=true;
           /* dumb 開著時體驗模式同樣拿到空清單＋dumb:true — 沒有模型選單，照樣能聊 */
-          return api("/api/playground/models").then(function(r){groups=r.rows||[];dumbMode=!!r.dumb;buildApp();});
+          return api("/api/playground/models").then(function(r){groups=r.rows||[];dumbMode=!!r.dumb;dumbVision=!!r.vision;buildApp();});
         });
       }
       if(!hasSvc()){paint();return;}
       return api("/api/playground/models").then(function(r){
         groups=r.rows||[];
         dumbMode=!!r.dumb;   // 模型被鎖定且隱藏：清單是空的但照樣能聊
+        dumbVision=!!r.vision;
         paint();
         /* 側欄 History 由外殼載入；#c=<id> 進來（他頁點歷史）就直接打開那筆 */
         var m=location.hash.match(/^#c=(.+)$/);
@@ -301,6 +350,16 @@ const PG_JS = `
           model=x.v;
           try{localStorage.setItem("ipua-pg-model",model);}catch(e){}
           updateTitle();
+          /* 換到看不了圖的模型時，還掛著的圖片附件會在送出時被伺服器擋下來（400）。
+             與其讓人打完字才發現，不如當下就清掉並講明原因。 */
+          if(!seesImages()){
+            var had=atts.filter(function(a){return a.kind==="image";}).length;
+            if(had){
+              atts=atts.filter(function(a){return a.kind!=="image";});
+              renderAtts();
+              MU.flash(tx("這個模型看不了圖片，已移除附加的圖片","This model can't read images — attached images removed"));
+            }
+          }
         });
         it.textContent=dup["m:"+x.name]>1?(x.name+" \\u00b7 "+x.ch):x.name;
         if(x.v===model){
@@ -388,11 +447,16 @@ const PG_JS = `
 
     var compW=el("div","pg-comp-w");
     var comp=el("div","pg-comp");
+    /* 待送出的附件列（在輸入框上方；沒有附件時整條隱藏） */
+    UI.atts=el("div","pg-atts");
+    UI.atts.style.display="none";
+    comp.appendChild(UI.atts);
+    var row=el("div","pg-comp-row");
     var plus=el("button","pg-plus");
     plus.type="button";plus.textContent="\\uff0b";
-    plus.title=tx("附加","Attach");
-    plus.addEventListener("click",function(){MU.flash(tx("功能未開放","Feature not available"));});
-    comp.appendChild(plus);
+    plus.title=tx("附加檔案","Attach files");
+    plus.addEventListener("click",function(e){e.stopPropagation();attachMenu(plus);});
+    row.appendChild(plus);
     UI.ta=el("textarea","pg-ta");
     UI.ta.rows=1;
     UI.ta.placeholder=tx("詢問任何問題","Ask anything");
@@ -401,7 +465,7 @@ const PG_JS = `
     UI.ta.addEventListener("keydown",function(e){
       if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing&&!coarse){e.preventDefault();send();}
     });
-    comp.appendChild(UI.ta);
+    row.appendChild(UI.ta);
     UI.send=el("button","pg-send");
     UI.send.innerHTML=SEND_ICON;
     UI.send.title=tx("送出","Send");
@@ -410,13 +474,164 @@ const PG_JS = `
       if(streaming){if(aborter)aborter.abort();return;}
       send();
     });
-    comp.appendChild(UI.send);
+    row.appendChild(UI.send);
+    comp.appendChild(row);
     compW.appendChild(comp);
     app.appendChild(compW);
+
+    /* 貼上圖片（截圖後直接 Ctrl+V — 主流聊天網站都有，而且是最常用的附圖方式） */
+    UI.ta.addEventListener("paste",function(e){
+      var items=(e.clipboardData&&e.clipboardData.files)||null;
+      if(!items||!items.length)return;
+      var fs=[];
+      for(var i=0;i<items.length;i++)if(PGA.isImage(items[i]))fs.push(items[i]);
+      if(!fs.length)return;      /* 純文字貼上照原本的行為走 */
+      e.preventDefault();
+      addFiles(fs);
+    });
+    /* 拖放整個聊天區。dragover 一定要 preventDefault，否則瀏覽器會直接開啟那個檔案 */
+    app.addEventListener("dragover",function(e){
+      if(!e.dataTransfer)return;
+      e.preventDefault();
+      app.classList.add("drop");
+    });
+    app.addEventListener("dragleave",function(e){
+      if(e.target===app)app.classList.remove("drop");
+    });
+    app.addEventListener("drop",function(e){
+      e.preventDefault();
+      app.classList.remove("drop");
+      var fs=(e.dataTransfer&&e.dataTransfer.files)||[];
+      if(fs.length)addFiles(Array.prototype.slice.call(fs));
+    });
 
     root.appendChild(app);
     mountTop();
     renderMsgs();
+  }
+
+  /* ================= 附件（v2.3）================= */
+  /* 待送出的附件。兩種形狀：
+       { kind:"image", id, url, name, bytes }  已上傳完成，送出時只帶 id
+       { kind:"doc", name, text, truncated }   在瀏覽器抽好的文字，送出時併進訊息內容
+     圖片是「選好就上傳」而不是「按送出才上傳」—— 使用者挑圖之後通常還要打字，
+     那段時間拿來把檔案傳完，按下送出時就不必再等。 */
+  var atts=[];
+
+  /* 目前選的模型看不看得懂圖片（管理員在管道裡標的 vision_models）。
+     dumb mode 下前端不知道模型是什麼，伺服器另外回一個布林。 */
+  function seesImages(){
+    if(dumbMode)return !!dumbVision;
+    if(!model)return false;
+    var pi=model.indexOf("|");
+    var cs=pi<0?"":model.slice(0,pi),mn=pi<0?"":model.slice(pi+1);
+    for(var i=0;i<groups.length;i++){
+      if(groups[i].slug===cs)return (groups[i].vision||[]).indexOf(mn)>=0;
+    }
+    return false;
+  }
+
+  function attachMenu(btn){
+    if(!window.SBPOP)return;
+    /* pgattach.js 沒載進來（網路壞了／被擋）→ 講清楚，不要讓按鈕按下去毫無反應 */
+    if(!window.PGA){MU.flash(tx("附件功能載入失敗，請重新整理","Attachment module failed to load — please refresh"));return;}
+    var canImg=seesImages();
+    window.SBPOP.open(btn,function(p){
+      var it=window.SBPOP.item(p,tx("上傳照片","Upload photo"),function(){
+        if(canImg)pickFiles(true);
+        else MU.flash(tx("目前的模型看不了圖片 — 請先在上方換一個支援視覺的模型","This model can't read images — pick a vision model above"));
+      });
+      /* 不支援時不把選項藏起來，而是留著並變灰：藏起來的話使用者只會覺得「功能壞了」，
+         留著才看得出「有這個功能，只是這個模型不行」。 */
+      if(!canImg){it.style.opacity=".45";it.title=tx("目前的模型看不了圖片","Current model can't read images");}
+      window.SBPOP.item(p,tx("上傳檔案","Upload file"),function(){pickFiles(false);});
+    });
+  }
+
+  function pickFiles(imageOnly){
+    var inp=document.createElement("input");
+    inp.type="file";inp.multiple=true;
+    inp.accept=imageOnly?PGA.acceptImage:PGA.acceptDoc;
+    inp.style.display="none";
+    inp.addEventListener("change",function(){
+      var fs=Array.prototype.slice.call(inp.files||[]);
+      inp.remove();
+      if(fs.length)addFiles(fs);
+    });
+    document.body.appendChild(inp);
+    inp.click();
+  }
+
+  /* 一次收一批檔案：圖片走壓縮＋上傳，文件在本地抽文字。
+     每個檔案各自成敗、互不影響 —— 一個壞檔不該讓整批都白選。 */
+  function addFiles(files){
+    if(streaming){MU.flash(tx("回覆生成中 — 先按停止","Still streaming — stop it first"));return;}
+    var maxBytes=1400*1024;   /* 跟伺服器 FILE_DEFAULTS.pgfile_max_kb 一致（超過那邊也會擋） */
+    files.forEach(function(f){
+      if(atts.length>=8){MU.flash(tx("一次最多 8 個附件","Up to 8 attachments at a time"));return;}
+      if(PGA.isImage(f)){
+        if(!seesImages()){
+          MU.flash(tx("目前的模型看不了圖片","This model can't read images"));
+          return;
+        }
+        var ph={kind:"image",name:f.name,bytes:f.size,busy:true,url:""};
+        atts.push(ph);renderAtts();
+        PGA.toImage(f,maxBytes).then(function(img){
+          ph.url="data:"+img.mime+";base64,"+img.b64;   /* 本地預覽，不必回讀伺服器 */
+          ph.bytes=img.bytes;
+          return PGA.upload(img);
+        }).then(function(d){
+          ph.id=d.id;ph.busy=false;renderAtts();
+        }).catch(function(e){
+          dropAtt(ph);
+          MU.flash(esc(e.message||e));
+        });
+      }else if(PGA.isDoc(f)){
+        var pd={kind:"doc",name:f.name,bytes:f.size,busy:true,text:""};
+        atts.push(pd);renderAtts();
+        PGA.toText(f).then(function(r){
+          pd.text=r.text;pd.truncated=r.truncated;pd.busy=false;renderAtts();
+        }).catch(function(e){
+          dropAtt(pd);
+          MU.flash(esc(e.message||e));
+        });
+      }else{
+        MU.flash(tx("不支援這種檔案："+f.name,"Unsupported file: "+f.name));
+      }
+    });
+  }
+
+  function dropAtt(a){
+    var i=atts.indexOf(a);
+    if(i>=0)atts.splice(i,1);
+    renderAtts();
+  }
+
+  function renderAtts(){
+    if(!UI.atts)return;
+    UI.atts.innerHTML="";
+    UI.atts.style.display=atts.length?"flex":"none";
+    atts.forEach(function(a){
+      var box=el("div","pg-att"+(a.busy?" busy":""));
+      if(a.kind==="image"&&a.url){
+        var im=document.createElement("img");im.src=a.url;im.alt=a.name||"";
+        box.appendChild(im);
+      }else{
+        var ic=el("div","fic",a.kind==="image"?"IMG":(PGA.ext(a.name)||"FILE").slice(0,4));
+        box.appendChild(ic);
+      }
+      var meta=el("div","fm");
+      meta.appendChild(el("div","fn",a.name||tx("未命名","Untitled")));
+      meta.appendChild(el("div","fs",a.busy?tx("處理中…","Processing…")
+        :(a.kind==="doc"?tx("文字 "+a.text.length+" 字","text, "+a.text.length+" chars")
+                        :PGA.fmtBytes(a.bytes||0))));
+      box.appendChild(meta);
+      var x=el("button","fx","\\u00d7");
+      x.type="button";x.title=tx("移除","Remove");
+      x.addEventListener("click",function(){dropAtt(a);});
+      box.appendChild(x);
+      UI.atts.appendChild(box);
+    });
   }
   function busy(){if(streaming){MU.flash(tx("回覆生成中 — 先按停止","Still streaming — stop it first"));return true;}return false;}
   function setEmpty(){
@@ -435,7 +650,16 @@ const PG_JS = `
     if(busy())return;
     api("/api/playground/conversations/"+id).then(function(d){
       cur=id;
-      msgs=(d.messages||[]).map(function(m){return{role:m.role,content:m.content,model:m.model};});
+      /* 附件是整串一次撈回來的，這裡按 msg_id 分回各則訊息。
+         purged=1（內容被淘汰）的照樣掛上去 —— 畫成「檔案已刪除」比整個消失清楚。 */
+      var byMsg={};
+      (d.files||[]).forEach(function(f){
+        if(!f.msg_id)return;
+        (byMsg[f.msg_id]=byMsg[f.msg_id]||[]).push({id:f.id,name:f.name,bytes:f.bytes,gone:!!f.purged});
+      });
+      msgs=(d.messages||[]).map(function(m){
+        return{id:m.id,role:m.role,content:m.content,model:m.model,files:byMsg[m.id]||[]};
+      });
       if(d.conv&&d.conv.channel&&d.conv.model){
         var v=d.conv.channel+"|"+d.conv.model;
         if(allModels().some(function(x){return x.v===v;})){model=v;updateTitle();}
@@ -446,6 +670,7 @@ const PG_JS = `
   }
   function newChat(){
     cur=null;msgs=[];
+    atts=[];renderAtts();   /* 換對話＝丟掉還沒送出的附件（它們是屬於那句話的） */
     if(window.SBH)window.SBH.setActive(null);
     renderMsgs();updateMore();
     if(!coarse&&UI.ta&&!UI.ta.disabled)UI.ta.focus();
@@ -461,7 +686,7 @@ const PG_JS = `
     setEmpty();
     if(!msgs.length)return;
     msgs.forEach(function(m){
-      if(m.role==="user")addUserMsg(m.content);
+      if(m.role==="user")addUserMsg(m.content,m.files);
       else addAiMsg(m.content,true);
     });
     UI.stick=true;scrollBottom(true);
@@ -469,11 +694,75 @@ const PG_JS = `
   function scrollBottom(force){
     if(force||UI.stick)UI.msgs.scrollTop=UI.msgs.scrollHeight;
   }
-  function addUserMsg(text){
+  /* 把「使用者打的字」與「併進去的檔案內容」拆開。
+     送出時用 【附件：檔名】\\n 內容 這個固定標記串起來（見 send），這裡照樣拆回來，
+     檔案內容才不會在氣泡裡攤成一大坨 —— 一個 Excel 抽出來的文字可以有幾萬字。 */
+  function splitDocs(s){
+    var MK="\\n\\n\\u3010\\u9644\\u4ef6\\uff1a";   /* \\n\\n【附件： */
+    var END="\\u3011\\n";                          /* 】\\n */
+    var out={text:s,docs:[]};
+    var i=s.indexOf(MK);
+    if(i<0)return out;
+    out.text=s.slice(0,i);
+    var rest=s.slice(i);
+    while(rest.indexOf(MK)===0){
+      var e=rest.indexOf(END);
+      if(e<0)break;
+      var name=rest.slice(MK.length,e);
+      var bodyAt=e+END.length;
+      var next=rest.indexOf(MK,bodyAt);
+      out.docs.push({name:name,body:next<0?rest.slice(bodyAt):rest.slice(bodyAt,next)});
+      rest=next<0?"":rest.slice(next);
+    }
+    return out;
+  }
+
+  function addUserMsg(text,files){
     var m=el("div","m user");
-    m.appendChild(el("div","mb-user",text));
+    /* 圖片排在氣泡上方（跟主流聊天網站一致：先看到圖，再看到問題） */
+    if(files&&files.length){
+      var wrap=el("div","m-atts");
+      files.forEach(function(f){
+        if(f.gone){
+          var g=el("div","m-att-gone","\\u{1F5BC} "+(f.name||tx("圖片","Image"))
+            +"\\u30fb"+tx("檔案已刪除","file removed"));
+          wrap.appendChild(g);
+          return;
+        }
+        var im=document.createElement("img");
+        /* 剛送出的用本地 data URL（零請求）；翻歷史對話的走端點，瀏覽器會快取起來 */
+        im.src=f.url||("/api/playground/files/"+f.id);
+        im.alt=f.name||"";
+        im.loading="lazy";
+        im.addEventListener("click",function(){lightbox(im.src);});
+        wrap.appendChild(im);
+      });
+      m.appendChild(wrap);
+    }
+    var parts=splitDocs(String(text==null?"":text));
+    var b=el("div","mb-user");
+    if(parts.text)b.textContent=parts.text;
+    parts.docs.forEach(function(d){
+      var det=document.createElement("details");det.className="mb-doc";
+      var sum=document.createElement("summary");
+      sum.textContent="\\u{1F4C4} "+d.name;
+      det.appendChild(sum);
+      var body=el("div","mb-doc-body");body.textContent=d.body;
+      det.appendChild(body);
+      b.appendChild(det);
+    });
+    m.appendChild(b);
     UI.msgs.appendChild(m);scrollBottom();
     return m;
+  }
+
+  /* 點縮圖看原圖 */
+  function lightbox(src){
+    var lb=el("div","pg-lb");
+    var im=document.createElement("img");im.src=src;
+    lb.appendChild(im);
+    lb.addEventListener("click",function(){lb.remove();});
+    document.body.appendChild(lb);
   }
   function addAiMsg(content,final){
     var m=el("div","m ai");
@@ -546,15 +835,32 @@ const PG_JS = `
   function send(){
     if(streaming)return;
     var text=UI.ta.value.replace(/\\s+$/,"");
-    if(!text.trim())return;
+    /* 附件還在壓縮／上傳／抽文字 — 這時送出會漏掉它們，擋下來比默默送出好 */
+    var pending=atts.filter(function(a){return a.busy;});
+    if(pending.length){MU.flash(tx("附件還在處理中，稍等一下","Attachments still processing…"));return;}
+    var imgs=atts.filter(function(a){return a.kind==="image"&&a.id;});
+    var docs=atts.filter(function(a){return a.kind==="doc";});
+    if(!text.trim()&&!imgs.length&&!docs.length)return;
     if(!model&&!dumbMode){MU.flash(tx("先選一個模型","Pick a model first"));return;}
     // Dumb mode：channel/model 留空 — 伺服器端會蓋成管理員指定的值
     var pi=model.indexOf("|"),channel=pi<0?"":model.slice(0,pi),mname=pi<0?"":model.slice(pi+1);
 
-    msgs.push({role:"user",content:text});
+    /* 文件類附件在這裡併進訊息內容 —— 從此它就是普通文字，模型不必支援 vision，
+       存進 D1、回讀、重送上下文全部照舊，不需要任何特殊處理。
+       標記固定用中文全形括號、不隨介面語言變：它同時是「顯示時要摺疊成檔案卡片」的依據，
+       跟著語言變的話，用中文送出的訊息改成英文介面回來就散開成一大坨純文字。 */
+    var outText=text;
+    docs.forEach(function(d){
+      outText+=(outText?"\\n\\n":"")+"\\u3010\\u9644\\u4ef6\\uff1a"+d.name+"\\u3011\\n"+d.text
+        +(d.truncated?"\\n\\u2026\\uff08\\u6a94\\u6848\\u904e\\u9577\\uff0c\\u4ee5\\u4e0a\\u53ea\\u662f\\u524d\\u9762\\u90e8\\u5206\\uff09":"");
+    });
+    var sentImgs=imgs.map(function(a){return{id:a.id,url:a.url,name:a.name,bytes:a.bytes};});
+
+    msgs.push({role:"user",content:outText,files:sentImgs});
     setEmpty();
-    addUserMsg(text);
+    addUserMsg(outText,sentImgs);
     UI.ta.value="";autoGrow();
+    atts=[];renderAtts();
     UI.stick=true;
 
     var node=addAiMsg("",false);
@@ -562,7 +868,17 @@ const PG_JS = `
     setStreaming(true);
     aborter=("AbortController" in window)?new AbortController():null;
 
-    var ctx=msgs.slice(-40).map(function(m){return{role:m.role,content:m.content};});
+    /* 上下文只帶檔案「編號」，不帶內容 —— 圖片絕不重新上傳（省頻寬，也讓伺服器的
+       request.json() 不必去解析幾 MB 的 base64）。內容已經淘汰的（gone）就不帶了，
+       伺服器那邊會自動補成文字佔位。 */
+    var ctx=msgs.slice(-40).map(function(m){
+      var o={role:m.role,content:m.content};
+      if(m.files&&m.files.length){
+        var ids=m.files.filter(function(f){return f.id&&!f.gone;}).map(function(f){return f.id;});
+        if(ids.length)o.files=ids;
+      }
+      return o;
+    });
     fetch("/api/playground/chat",{
       method:"POST",
       headers:{"content-type":"application/json"},

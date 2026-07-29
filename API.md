@@ -75,6 +75,8 @@ curl -X POST https://uaip.cc.cd/api/admin/articles ^
 | `POST /api/playground/chat` | Playground 聊天（SSE 串流；要有 playground 服務，見 §5f） |
 | `GET /api/playground/conversations` | 自己的 Playground 對話列表 |
 | `GET/PUT/DELETE /api/playground/conversations/{id}` | 讀取訊息／改名／刪除自己的對話 |
+| `POST /api/playground/files` | 上傳聊天附件圖片（本體＝raw base64，見 §5f） |
+| `GET /api/playground/files/{id}` | 讀回附件圖片（只能讀自己的） |
 
 ### 會員服務端點（不同驗證）
 
@@ -392,6 +394,7 @@ curl -X PUT https://uaip.cc.cd/api/admin/prices ^
 | `api_key` | 上游金鑰（只有管理員 API 摸得到，回讀一律遮罩） |
 | `models` | **必填** 這個管道可用的模型名稱（陣列，或逗號／換行分隔的字串；限英數與 `. _ / : -`、上限 40 個）。會員頁與 Playground 都靠這份清單 |
 | `system_prompt` | **選填** 這個管道在 **Playground** 的系統提示詞（上限 8000 字，超過回 400、不截斷）。**留空＝套用站台預設**（`PUT /api/admin/settings` 的 `pg_default_system`，沒設過就是程式內建的 `PG_DEFAULT_SYSTEM`；管理員視窗那格的灰字顯示的就是當下實際會套的那段）；填了就**整段取代**預設。要一次改掉全部渠道的人設就改站台預設，不必逐個渠道填。**只作用在 `/playground`**：`/relay` API 中轉是透明代理，一律不注入任何提示詞 — 會員自己送什麼就轉什麼 |
+| `vision_models` | **選填**（2026-07-29 v2.3）這個管道裡**看得懂圖片**的模型（陣列或換行/逗號分隔字串），**必須是 `models` 的子集**（填了沒開放的模型回 400）。**留空＝這個管道不支援附圖**——各家都沒有查詢模型能力的端點、名字也看不出來，所以一律預設不支援，管理員明確填了才開放。會員在 /playground 的附件鈕會依這份清單決定能不能點 |
 | `extra_body` | **選填** 合併進 **Playground** 上游請求本體的額外參數，必須是 **JSON 物件字串**（上限 4000 字；存檔當下就驗，不合法回 400）。**留空＝不合併任何東西**（注意：跟 `system_prompt` 的「留空＝套預設」相反，網頁上那格的灰字只是範例）。用來處理各家專屬參數，例 `{"venice_parameters":{"include_venice_system_prompt":false}}`、OpenAI 的 `reasoning_effort`、Anthropic 的 `thinking`。`model`／`stream`／`messages`／`contents` 擋著**不給覆寫**。**只作用在 `/playground`**，`/relay` 中轉不注入 |
 | `enabled` | 預設 true |
 
@@ -470,10 +473,10 @@ Authorization: Bearer uak-你的金鑰
 
 **體驗模式也一起噤聲**：dumb 開著時匿名訪客的 `models` 同樣只回 `{ demo:true, rows:[], dumb:true }`，`chat` 的 channel/model 也被蓋掉。但蓋成的是**體驗模式自己的**設定（`demo_channel` ＋ `demo_models` 的第一個；白名單留空就取該渠道的第一個模型），**不是** `dumb_channel`/`dumb_model` — 因為體驗模式的 fail-closed 限流與 `demo_max_tokens` 全綁在 `demo_channel` 上，被 dumb 的渠道蓋掉等於那些燒錢上限一起失效。也就是說 dumb 對體驗模式只做「不讓訪客挑」，跑哪個仍由體驗模式的設定決定。
 
-- `GET /api/playground/models` → `{ rows:[{ slug, name, models }] }`（只列啟用中且有設模型的渠道；**不含 `kind`** — 那等於標示真實提供商）。
+- `GET /api/playground/models` → `{ rows:[{ slug, name, models, vision }] }`（只列啟用中且有設模型的渠道；**不含 `kind`** — 那等於標示真實提供商）。`vision` 是該渠道裡**看得懂圖片**的模型子集（管理員在管道的 `vision_models` 標的，沒標＝空陣列）。dumb mode 下改回 `{ rows:[], dumb:true, vision:true|false }` — 模型名保密，但「能不能附圖」得讓前端知道，否則附件鈕只能一律關掉或一律開著。
 - `GET /api/playground/conversations` → `{ rows:[{ id, title, channel, model, created_at, updated_at }] }`（自己的，新→舊，最多 100 筆）。**管理員要看全站所有人的對話**看 §5 的 `/api/admin/conversations`（或 /logs 的「總對話紀錄」分頁）。
-- `GET /api/playground/conversations/{id}` → `{ conv, messages:[{ id, role, content, model, created_at }] }`。
-- `PUT /api/playground/conversations/{id}` 本體 `{ "title":"新名字" }` 改名；`DELETE` 刪除（連同訊息）。
+- `GET /api/playground/conversations/{id}` → `{ conv, messages:[{ id, role, content, model, created_at }], files:[{ id, msg_id, mime, name, bytes, w, h, purged }] }`。`files` 是整串對話的附件中繼資料（前端按 `msg_id` 分回各則訊息）；**內容要另外打 `/api/playground/files/{id}`**。`purged:1`＝內容已被清除，中繼資料留著讓前端畫「檔案已刪除」。
+- `PUT /api/playground/conversations/{id}` 本體 `{ "title":"新名字" }` 改名；`DELETE` 刪除（連同訊息**與附件**）。
 - `POST /api/playground/chat` 本體：
 
 ```json
@@ -491,6 +494,35 @@ Authorization: Bearer uak-你的金鑰
   - 中斷連線（前端按「停止」）＝停止生成，已生成的內容照樣存進對話。
   - 伺服器依渠道 kind 自動轉換請求／串流格式：openai、custom → `/v1/chat/completions`；anthropic → `/v1/messages`；gemini → `/v1beta/models/{model}:streamGenerateContent?alt=sse`。
   - **錯誤訊息對會員做了消毒**（2026-07-14）：上游的原始錯誤內容（錯誤格式、文件連結、專案編號）會洩漏真實提供商身分，所以會員只看得到安全分類字（401/403→「渠道憑證可能失效」、429→「上游流量限制」、5xx→「上游暫時故障」…），`detail` 原文**只有管理員**（is_admin 或管理金鑰）看得到。
+
+### 附件（2026-07-29 v2.3.0）
+
+聊天可以附**圖片**（給看得懂圖的模型看）與**文件**（docx/xlsx/pptx/txt/csv/程式碼…）。兩者走完全不同的路：
+
+| | 圖片 | 文件 |
+|---|---|---|
+| 怎麼送 | 先上傳成一筆檔案，訊息帶 `files:[編號]` | **在瀏覽器就抽成純文字**，直接併進 `content` |
+| 需要模型支援 vision | 是 | **否**（純文字模型也能「讀」Word 檔） |
+| 佔儲存空間 | 是 | 否 |
+
+- `POST /api/playground/files?mime=image/webp&name=a.webp&w=800&h=600` → `{ id, mime, name, bytes, w, h }`
+  - **本體直接是 base64 字串**（`Content-Type: text/plain`），不是 JSON、也不是二進位。這是為了 CPU：三家上游都只吃 base64，收二進位的話每次對話都要 `btoa` 編一次（1MB 圖 8.11ms，而免費方案每請求只有 10ms），包成 JSON 則是 `JSON.parse` 要逐字元掃過整段 base64（比 raw 慢 4.7 倍）。收 base64 原字串等於「瀏覽器編好、伺服器原封轉手」，全程不編不解。
+  - 只收 **jpeg / png / webp / gif**。**宣告的 `mime` 必須與實際檔頭相符**（只解前 24 個字元驗魔術位元組），不符回 415 `type-mismatch`。svg 永遠不收（可執行的 XML）。
+  - 三層容量限制：單檔 `pgfile_max_kb`（預設 1400KB — D1 單值 2,000,000 bytes 反推 base64 膨脹後的天花板）、每人 `pgfile_user_mb`（預設 30MB）、全站 `pgfile_total_mb`（預設 300MB，超過由每日 cron 從**最舊**的開始清內容）。前兩層超過回 413。
+  - 剛上傳的檔案是**孤兒**（還沒綁對話），要等 `chat` 帶著它的編號送出才綁定；一直沒送出的**24 小時後由 cron 清掉**。
+  - 體驗模式（未登入）也能上傳，吃同一套 demo 限流；全體匿名訪客共用 `demo:public` 這一個帳號的容量配額。
+- `GET /api/playground/files/{id}` → 圖片二進位（翻歷史對話時用）。只能讀自己的；**體驗模式上傳的只有管理員讀得到**（那些檔案全掛在 `demo:public` 名下，開放匿名讀取的話訪客只要把編號加一就能翻別人的）。內容已被清除回 **410 `purged`**（附 `name`/`bytes` 讓前端畫佔位）。
+- `POST /api/playground/chat` 的訊息可帶 `files`：
+
+```json
+{ "channel":"x", "model":"gpt-4o",
+  "messages":[ { "role":"user", "content":"這張圖是什麼？", "files":[12,13] } ] }
+```
+
+  - 模型必須被管理員標進該管道的 `vision_models`，否則回 400 `no-vision`（**檢查在建立對話之前** — 不留下「訊息存了但圖沒送到」的半吊子狀態）。
+  - 單則最多 4 張；**單次請求所有圖片的原始大小合計上限 1.5MB**。這個數字是量出來的：組上游 body 的成本 933KB→1.62ms、1.8MB→3.31ms、2.8MB→6.00ms，而這筆花費發生在**串流開始之前**，花掉的每一毫秒都是從串流迴圈的預算裡扣的。
+  - 超出預算、或模型看不了圖（歷史訊息）、或內容已被清除 → 那幾張**降級成文字佔位**「[已省略的圖片：檔名]」而不是報錯。原則是**不要因為附件的問題讓人連話都說不出來**：從最舊的開始降級，最新那張（通常就是他正在問的）保到最後。
+  - 別人的檔案編號塞進來一律查不到（`WHERE user_id=自己`），靜默降級成佔位，不會洩漏任何內容。
 
 ## 6. 常用流程速查
 

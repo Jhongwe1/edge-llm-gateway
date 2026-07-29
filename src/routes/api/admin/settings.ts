@@ -33,11 +33,17 @@ import { adminOk, pgOpenAll } from "../../../lib/auth.js";
 import { QUOTA_DEFAULTS } from "../../../lib/quota.js";
 import { DEMO_DEFAULTS, demoCfg } from "../../../lib/demo.js";
 import { PG_DEFAULT_SYSTEM } from "../../../lib/playground.js";
+import { FILE_DEFAULTS } from "../../../lib/filestore.js";
 import { audit } from "../../../lib/observe.js";
 import type { RouteCtx } from "../../../types.js";
 
 const QUOTA_KEYS = ["quota_relay_day", "quota_pg_day", "rl_per_min"];
 const DEMO_NUM_KEYS = ["demo_per_min", "demo_per_ip_day", "demo_global_day", "demo_max_tokens"];
+// Playground 附件的三層容量（2026-07-29 v2.3，預設值在 lib/filestore.ts FILE_DEFAULTS）：
+// 單檔 KB／每人 MB／全站 MB。跟 QUOTA_KEYS 走同一套語意（正整數，空字串＝刪鍵＝回預設）。
+// ⚠ pgfile_max_kb 調高要注意 D1 單值上限 2,000,000 bytes —— base64 會膨脹成 4/3 倍，
+// 超過 1464KB 就會在寫入時炸掉（存 R2 時才不受這條限制）。
+const FILE_KEYS = ["pgfile_max_kb", "pgfile_user_mb", "pgfile_total_mb"];
 const ALL_KEYS = [
   "brand",
   "contact_url",
@@ -62,7 +68,8 @@ const ALL_KEYS = [
   "tg_chat_id"
 ]
   .concat(QUOTA_KEYS)
-  .concat(DEMO_NUM_KEYS);
+  .concat(DEMO_NUM_KEYS)
+  .concat(FILE_KEYS);
 
 // Telegram bot token 的遮罩提示（同 relay 管道 key_hint 精神：只給尾 4 碼）
 function tgHint(v: string | undefined): string {
@@ -81,7 +88,8 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
       "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_open','pg_default_system','relay_meter'," +
         "'quota_relay_day','quota_pg_day','rl_per_min','tg_bot_token','tg_chat_id'," +
         "'demo_mode','demo_channel','demo_models','demo_per_min','demo_per_ip_day','demo_global_day','demo_max_tokens'," +
-        "'dumb_mode','dumb_channel','dumb_model','vpn_public')"
+        "'dumb_mode','dumb_channel','dumb_model','vpn_public'," +
+        "'pgfile_max_kb','pgfile_user_mb','pgfile_total_mb')"
     ).all();
     const st: Record<string, string> = {};
     ((res.results || []) as { k: string; v: string }[]).forEach(function (r) {
@@ -119,6 +127,10 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
       dumb_channel: st.dumb_channel || "",
       dumb_model: st.dumb_model || "",
       vpn_public: st.vpn_public === "1",
+      // Playground 附件的三層容量（v2.3）；null＝沒設過＝用 defaults 那組
+      pgfile_max_kb: numOrNull(st.pgfile_max_kb),
+      pgfile_user_mb: numOrNull(st.pgfile_user_mb),
+      pgfile_total_mb: numOrNull(st.pgfile_total_mb),
       // Telegram 告警：token 絕不回明文（只回 set/hint）；chat id 不是秘密可回。
       // tg_active＝告警實際會不會發（D1 或 secrets 湊齊 token+chat 其一即可）。
       tg_chat_id: st.tg_chat_id || "",
@@ -136,7 +148,10 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
         demo_per_min: DEMO_DEFAULTS.demo_per_min,
         demo_per_ip_day: DEMO_DEFAULTS.demo_per_ip_day,
         demo_global_day: DEMO_DEFAULTS.demo_global_day,
-        demo_max_tokens: DEMO_DEFAULTS.demo_max_tokens
+        demo_max_tokens: DEMO_DEFAULTS.demo_max_tokens,
+        pgfile_max_kb: FILE_DEFAULTS.pgfile_max_kb,
+        pgfile_user_mb: FILE_DEFAULTS.pgfile_user_mb,
+        pgfile_total_mb: FILE_DEFAULTS.pgfile_total_mb
       }
     });
   } catch (e: any) {
@@ -212,7 +227,7 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
         del("pg_default_system"); // 空＝回到內建 PG_DEFAULT_SYSTEM
       else put("pg_default_system", ps);
     }
-    for (const k of QUOTA_KEYS) {
+    for (const k of QUOTA_KEYS.concat(FILE_KEYS)) {
       if (!(k in body)) continue;
       const v = body[k];
       if (v === null || v === "") {

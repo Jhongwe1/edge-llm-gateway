@@ -9,6 +9,8 @@
 // 下一輪 tgAlertScan 自然把 cron 自身的故障也告警出去。
 // 測試性：now 可注入；job 函式全部具名匯出、可直呼。
 import { reportErrorNow } from "./lib/observe.js";
+import { deleteFiles, evictOldest, fileLimits } from "./lib/filestore.js";
+import type { FileRow } from "./lib/filestore.js";
 import type { Env, Row } from "./types.js";
 
 export const CRON_ALERTS = "*/5 * * * *";
@@ -94,6 +96,9 @@ const BACKUP_TABLES: { t: string; cols: string }[] = [
   { t: "articles", cols: "*" },
   { t: "pages", cols: "*" },
   { t: "media", cols: "id,mime,bytes,w,h,created_at" }, // data BLOB 排除
+  // 附件同理排除內容欄位（b64 動輒幾百 KB，全量備份會把 R2 物件撐爆、也吃 CPU）——
+  // 備份的價值在「哪則訊息掛過哪個檔案」這層關聯，圖片本身遺失是可接受的損失。
+  { t: "pg_files", cols: "id,user_id,conv_id,msg_id,kind,mime,name,bytes,w,h,storage,purged,created_at" },
   { t: "users", cols: "*" },
   { t: "sessions", cols: "*" },
   { t: "relay_channels", cols: "*" },
@@ -146,21 +151,106 @@ export async function backupToR2(env: Env, now?: Date): Promise<string> {
   return key + "（" + total + " 列" + (excess.length ? "；清掉 " + excess.length + " 份舊備份" : "") + "）";
 }
 
+// 保留期限（天）。改這裡就好 —— 三個數字都在同一個地方，不必翻 SQL。
+export const RETAIN = {
+  reqLog: 90, // 請求紀錄（計量明細；長期趨勢看 usage_daily，那張永久保留）
+  conv: 360, // 對話（以 updated_at 計，見 purgeOld 的說明）
+  visits: 180, // 訪客紀錄（2026-07-29 站長拍板；此表在此之前**完全沒有**清理機制）
+  orphanFileHours: 24 // 上傳了卻沒送出的附件
+};
+
 /**
- * 保留清理（接手 lib/quota.ts 退役的 1% 隨機清舊 hack）：
- * req_log 90 天、sessions 已過期、pg_messages 360 天（DEBT #2 拍板的過期歸檔門檻）。
+ * 保留清理（接手 lib/quota.ts 退役的 1% 隨機清舊 hack）。
+ *
+ * ## 2026-07-29 的兩個修正（v2.3）
+ *
+ * **對話改成整則過期，而不是逐則訊息過期。** 舊規則是「pg_messages 超過 360 天就刪」，
+ * 但 pg_conversations **完全沒有任何清理** —— 訊息被刪光之後，對話的殼會永遠留在
+ * 側邊欄 History 裡，點進去一片空白，而且只會越積越多。發作時間是站台上線滿一年，
+ * 也就是那種「等你發現時已經一堆」的債。
+ * 現在改成以 updated_at 判斷整則對話：過期就連訊息、附件一起刪，殼跟內容同進同出。
+ * 副作用是「一直在用的長壽對話」永遠不會被清 —— 那是使用者主動在維護的對話，該留。
+ *
+ * **visits 開始有保留期限。** 這張表每個請求寫一筆、以前沒有任何上限。空間其實不急
+ * （實測平均 242 bytes／筆、約 116 筆／天），真正的風險是 D1 免費方案**每日 10 萬列寫入**：
+ * 被爬蟲密集掃時一天寫進幾萬筆是很容易的事，額度一旦燒光，那天剩下的時間**整站的
+ * D1 寫入全部失敗**（登入、聊天、發文一起掛）。保留期限解決不了單日暴衝（那需要取樣或
+ * 寫入上限，記在 DEBT），但至少讓長期成長有天花板。
+ *
+ * 順序有意義：先刪過期對話（連帶清掉它們的附件），再清孤兒，最後才做全站容量淘汰 ——
+ * 前面每一步都在釋放空間，最後那步要處理的量才會是真正的超量。
  */
 export async function purgeOld(env: Env, now?: Date): Promise<string> {
   const t = (now || new Date()).getTime();
+  const ago = (days: number): string => new Date(t - days * 86400e3).toISOString();
+  const notes: string[] = [];
+
+  // 1) 過期對話 → 附件（含 R2 物件）→ 訊息 → 對話本身。
+  //    一次最多 500 則，避免單次 job 跑太久；沒清完下一輪繼續。
+  let convGone = 0;
+  try {
+    const rs = await env.DB.prepare("SELECT id FROM pg_conversations WHERE updated_at<?1 LIMIT 500")
+      .bind(ago(RETAIN.conv))
+      .all();
+    const ids = ((rs.results || []) as { id: number }[]).map((r) => Number(r.id));
+    if (ids.length) {
+      const inList = "(" + ids.join(",") + ")";
+      const fr = await env.DB.prepare("SELECT * FROM pg_files WHERE conv_id IN " + inList).all();
+      await deleteFiles(env, (fr.results || []) as FileRow[]);
+      const res = await env.DB.batch([
+        env.DB.prepare("DELETE FROM pg_messages WHERE conv_id IN " + inList),
+        env.DB.prepare("DELETE FROM pg_conversations WHERE id IN " + inList)
+      ]);
+      convGone = Number(res[1] && res[1].meta && res[1].meta.changes) || 0;
+    }
+  } catch (e) {
+    notes.push("對話清理失敗");
+  }
+
+  // 2) 例行清理（可以一批打完的部分）
   const res = await env.DB.batch([
-    env.DB.prepare("DELETE FROM req_log WHERE ts<?1").bind(new Date(t - 90 * 86400e3).toISOString()),
+    env.DB.prepare("DELETE FROM req_log WHERE ts<?1").bind(ago(RETAIN.reqLog)),
     env.DB.prepare("DELETE FROM sessions WHERE expires_at<?1").bind(new Date(t).toISOString()),
-    env.DB.prepare("DELETE FROM pg_messages WHERE created_at<?1").bind(
-      new Date(t - 360 * 86400e3).toISOString()
-    )
+    env.DB.prepare("DELETE FROM visits WHERE ts<?1").bind(ago(RETAIN.visits)),
+    // 孤兒訊息：對話已經不在了，訊息卻還在（歷史資料或中途失敗留下的殘骸）
+    env.DB.prepare("DELETE FROM pg_messages WHERE conv_id NOT IN (SELECT id FROM pg_conversations)")
   ]);
   const n = (i: number): number => Number(res[i] && res[i].meta && res[i].meta.changes) || 0;
-  return "req_log −" + n(0) + "、sessions −" + n(1) + "、pg_messages −" + n(2);
+
+  // 3) 孤兒附件：上傳了但一直沒隨訊息送出（使用者改變主意、關掉分頁）。
+  //    24 小時的寬限期是為了「上傳完擱著、隔天回來才送出」這種正常情境。
+  let orphan = 0;
+  try {
+    const fr = await env.DB.prepare("SELECT * FROM pg_files WHERE msg_id IS NULL AND created_at<?1 LIMIT 500")
+      .bind(new Date(t - RETAIN.orphanFileHours * 3600e3).toISOString())
+      .all();
+    orphan = await deleteFiles(env, (fr.results || []) as FileRow[]);
+  } catch (e) {}
+
+  // 4) L3 全站容量淘汰：超過上限就從最舊的開始清內容（中繼資料留著顯示「檔案已刪除」）
+  let evicted = 0;
+  try {
+    const lim = await fileLimits(env);
+    evicted = await evictOldest(env, lim.totalMb);
+  } catch (e) {}
+
+  notes.push(
+    "req_log −" +
+      n(0) +
+      "、sessions −" +
+      n(1) +
+      "、visits −" +
+      n(2) +
+      "、對話 −" +
+      convGone +
+      "、孤兒訊息 −" +
+      n(3) +
+      "、孤兒附件 −" +
+      orphan +
+      "、附件淘汰 −" +
+      evicted
+  );
+  return notes.join("；");
 }
 
 // 單一 job 的隔離執行：成功／失敗都寫 settings cron_last_<name>；失敗再寫 errlog（告警會撈到）

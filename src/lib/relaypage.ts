@@ -261,7 +261,13 @@ const RELAY_JS = `
         var tg=el("button","btn",c.enabled?tx("停用","Disable"):tx("啟用","Enable"));
         tg.addEventListener("click",function(){
           tg.disabled=true;
-          api("/api/admin/relay/channels/"+c.id,{method:"PUT",json:{name:c.name,slug:c.slug,kind:c.kind,base_url:c.base_url,models:c.models,enabled:!c.enabled}})
+          /* ⚠ 這個 PUT 一定要帶「完整」欄位。cleanChannel 對沒帶的選填欄位一律當成空字串
+             寫回去（PUT＝整包覆蓋，不是 PATCH），所以少帶一欄就是把那欄的資料洗掉。
+             2026-07-29 發現的既有 bug：這裡原本只帶 6 欄，於是按一下「停用」再「啟用」，
+             該管道的系統提示詞與額外請求參數就無聲消失了 —— 而管理員完全不會發現，
+             要等到某個會員發現人設不見、或 Venice 那類渠道又開始洩漏身分才查得出來。
+             以後新增管道欄位時，這一行要跟著加。 */
+          api("/api/admin/relay/channels/"+c.id,{method:"PUT",json:{name:c.name,slug:c.slug,kind:c.kind,base_url:c.base_url,models:c.models,system_prompt:c.system_prompt,extra_body:c.extra_body,vision_models:c.vision_models,enabled:!c.enabled}})
             .then(function(){reloadAdmin(box);MU.flash(c.enabled?tx("已停用","Disabled"):tx("已啟用","Enabled"));})
             .catch(function(e){tg.disabled=false;MU.flash(esc(e.message||e));});
         });
@@ -307,6 +313,16 @@ const RELAY_JS = `
     var fModels=el("textarea");fModels.rows=3;fModels.placeholder="gpt-4o-mini\\ngpt-4o";
     fModels.value=(c.models||[]).join("\\n");
     mf.appendChild(fModels);dlg.appendChild(mf);
+    // 視覺模型（選填，v2.3）：上面那份清單裡「看得懂圖片」的那幾個。
+    // 為什麼要人工填而不是自動判斷：各家都沒有查詢模型能力的端點，名字也看不出來
+    // （同一個系列常常有 vision 版與純文字版）。猜錯的代價不對稱 —— 以為能送圖但其實
+    // 不能，會員送出後只會拿到一句上游打回來的錯誤；反過來只是附件鈕灰著。
+    // 所以預設一律「不支援」，管理員明確填了才開放。
+    var vf=el("div","field");
+    vf.appendChild(el("label",null,tx("其中看得懂圖片的模型（一行一個，留空＝這個渠道不支援附圖）","Vision-capable models (one per line, blank = no image support)")));
+    var fVis=el("textarea");fVis.rows=2;fVis.placeholder="gpt-4o";
+    fVis.value=(c.vision_models||[]).join("\\n");
+    vf.appendChild(fVis);dlg.appendChild(vf);
     // Playground 系統提示詞（選填）：只作用在 /playground；/relay API 中轉是透明代理，
     // 不會注入這段（會員送什麼就轉什麼）。標籤寫明，免得以為中轉那邊也會套用。
     var sf=el("div","field");
@@ -363,7 +379,7 @@ const RELAY_JS = `
     cancel.addEventListener("click",close);
     ov.addEventListener("click",function(e){if(e.target===ov)close();});
     save.addEventListener("click",function(){
-      var payload={name:fName.value.trim(),kind:sel.value,base_url:fBase.value.trim(),models:fModels.value,system_prompt:fSys.value,extra_body:fExtra.value,enabled:isNew?1:!!c.enabled};
+      var payload={name:fName.value.trim(),kind:sel.value,base_url:fBase.value.trim(),models:fModels.value,system_prompt:fSys.value,extra_body:fExtra.value,vision_models:fVis.value,enabled:isNew?1:!!c.enabled};
       if(fKey.value!=="")payload.api_key=fKey.value;      // 空＝不帶＝保留舊值（編輯）；新增時空＝空金鑰
       else if(isNew)payload.api_key="";
       save.disabled=true;save.textContent=tx("儲存中…","Saving…");

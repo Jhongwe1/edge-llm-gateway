@@ -26,7 +26,9 @@ import {
   extractFull,
   extractUsage,
   chModels,
-  dumbCfg
+  dumbCfg,
+  loadImages,
+  modelSeesImages
 } from "../../../lib/playground.js";
 import { fastDelta } from "../../../lib/fastsse.js";
 import { checkQuota } from "../../../lib/quota.js";
@@ -165,6 +167,19 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   if (!ch.api_key)
     return json({ error: "no-upstream-key", hint: "渠道還沒設定上游金鑰，請管理員到 /relay 補上" }, 502);
 
+  // 附件（v2.3）：模型吃不吃圖是管理員在管道裡明確標的（vision_models，migration 0007）。
+  // 這一則帶了圖、模型卻看不了 → 在**建立對話之前**就擋掉，不要留下一個
+  // 「訊息存了、圖也綁了、但上游根本收不到圖」的半吊子狀態。
+  // 前端本來就會把不支援的模型的附件鈕變灰，走到這裡代表是直接打 API 或切換過模型。
+  const sees = modelSeesImages(ch, v.model);
+  const lastMsg = v.messages[v.messages.length - 1];
+  if (!sees && lastMsg && lastMsg.fileIds && lastMsg.fileIds.length) {
+    return json(
+      { error: "no-vision", hint: "「" + v.model + "」看不了圖片 — 請換一個支援視覺的模型，或把圖片移除" },
+      400
+    );
+  }
+
   // 對話：沒帶 conv_id＝開新對話（標題自動取第一句 user 訊息）。
   // demo 的對話 2026-07-21 起也落地 —— 全掛在 demo:public 這一列名下，只有管理員在
   // /logs 的對話紀錄看得到；訪客沒有列表、也讀不到（那兩支端點都要登入，見下面的歸屬檢查）。
@@ -195,11 +210,31 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   }
   // 先存 user 訊息 — 就算上游掛了，問過的問題也不會消失
   const lastUser = v.messages[v.messages.length - 1];
-  await env.DB.prepare(
+  const insUser = await env.DB.prepare(
     "INSERT INTO pg_messages (conv_id,role,content,model,created_at) VALUES (?1,'user',?2,?3,?4)"
   )
     .bind(convId, lastUser.content, v.model, now)
     .run();
+
+  // 把這一則帶上來的附件從「孤兒」狀態綁到這則訊息上（v2.3）。
+  //   AND user_id=?  → 別人的檔案編號綁不過來
+  //   AND msg_id IS NULL → 已經屬於別則訊息的不會被搶走（同一張圖重送要重新上傳）
+  // 綁定失敗不影響聊天：圖照樣送得出去，只是那筆檔案會維持孤兒狀態、24 小時後被 cron 清掉。
+  if (lastUser.fileIds && lastUser.fileIds.length) {
+    try {
+      await env.DB.prepare(
+        "UPDATE pg_files SET conv_id=?1, msg_id=?2 WHERE id IN (" +
+          lastUser.fileIds.join(",") +
+          ") AND user_id=?3 AND msg_id IS NULL"
+      )
+        .bind(convId, insUser.meta.last_row_id, user.id)
+        .run();
+    } catch (e) {}
+  }
+
+  // 檔案編號 → 實際 base64 內容（含總量預算與降級，見 loadImages）
+  const imgLoad = await loadImages(env, user, v.messages, sees);
+  if (imgLoad.err) return json({ error: "no-vision", hint: imgLoad.err, conv: convId }, 400);
 
   // 打上游（demo 有填 demo_max_tokens 才壓回覆長度；留空＝0＝跟會員路徑一樣不設限）
   // 站台預設系統提示詞只在「這個管道自己沒填」時才需要查 — 有填的話那一查是純浪費，

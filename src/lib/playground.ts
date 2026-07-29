@@ -9,13 +9,26 @@
 //   3. 管理員／agent 可用 Authorization: Bearer <LOGS_TOKEN> 直接測（身分算管理員帳號）。
 import { json } from "./site.js";
 import { getSessionUser, goodOrigin, canUsePlayground, adminEmails, isDevEnv, tokenEqual } from "./auth.js";
+import { getB64 } from "./filestore.js";
+import type { FileRow } from "./filestore.js";
 import type { ChannelRow, Env, UserRow } from "../types.js";
 
 export const PG_LIMITS = {
   maxMsgs: 80, // 一次請求最多帶的訊息數（前端會自己修剪，這是硬上限）
   maxChars: 100000, // 單則訊息字數上限
   maxTotal: 300000, // 整包訊息字數上限
-  maxTokens: 4096 // anthropic 必填 max_tokens；取各型號都安全的值
+  maxTokens: 4096, // anthropic 必填 max_tokens；取各型號都安全的值
+  // ── 附件（v2.3）──
+  maxImgPerMsg: 4, // 單則訊息最多幾張圖
+  // 單次請求「所有圖片」的原始 bytes 總和上限。這個數字是量出來的，不是拍的：
+  // 組上游 body 的成本（含 fetch 必付的 bytes 轉換，實測 2026-07-29）
+  //   933KB base64 → 1.62ms ｜ 1.8MB → 3.31ms ｜ 2.8MB → 6.00ms
+  // 免費方案每請求 10ms CPU，而這筆花費發生在**串流開始之前** —— 花掉的每一毫秒
+  // 都是從後面串流迴圈的預算裡扣的。1.5MB 原始（≈2MB base64）約 2.4ms，
+  // 留 7.5ms 給串流、D1 與其他工作，這是安全的分配。
+  // 超出的部分不是報錯，而是把**最舊**的圖降級成文字佔位（見 chat.ts pickImages）——
+  // 使用者不會因為對話變長就突然被擋住，只是模型看不到很久以前那幾張圖。
+  maxImgBytesTotal: 1500000
 };
 
 // 管道沒填系統提示詞時，playground 實際送出的預設值。
@@ -116,9 +129,21 @@ export async function pgUser(request: Request, env: Env, url: URL): Promise<PgUs
 }
 
 // 整理聊天請求本體 → { convId, channel, model, messages } 或 { err }
+
+// 訊息附帶的圖片。b64＝base64 原字串（不含 data: 前綴）——
+// 從瀏覽器到上游全程都是這個形狀，Worker 不編也不解（見 lib/filestore.ts 檔頭）。
+export interface ChatImage {
+  mime: string;
+  b64: string;
+}
 export interface ChatMsg {
   role: "user" | "assistant" | "system";
   content: string;
+  // 前端送進來的是檔案編號（body 不含 base64 —— 圖片絕不重新上傳，
+  // 也就不會讓 request.json() 去解析幾 MB 的 base64）。
+  fileIds?: number[];
+  // 伺服器查完 D1 之後填進來的實際內容，只有 buildUpstream 會讀。
+  images?: ChatImage[];
 }
 export type CleanChatResult =
   | { convId: number | null; channel: string; model: string; messages: ChatMsg[]; err?: undefined }
@@ -146,12 +171,31 @@ export function cleanChat(b: any): CleanChatResult {
             ? "user"
             : null;
     if (!role) return { err: "role 只能是 user / assistant / system" };
-    const content = String(m.content == null ? "" : m.content);
-    if (!content.trim()) continue;
+    // 控制字元一律剝掉。除了衛生問題，這裡還有一個硬性理由：組上游 body 時用
+    // U+0001 當圖片佔位符（見 fillImages），使用者的文字若混進同一個字元就會誤配。
+    // 保留 \n \r \t —— 那三個是正常內容。
+    const content = String(m.content == null ? "" : m.content).replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+      ""
+    );
+    const fileIds = Array.isArray(m.files)
+      ? m.files
+          .map(function (x: unknown) {
+            return parseInt(String(x), 10);
+          })
+          .filter(function (x: number) {
+            return x > 0;
+          })
+          .slice(0, PG_LIMITS.maxImgPerMsg)
+      : [];
+    // 純圖片、沒有文字的訊息是合法的（「這張圖是什麼？」有時就只丟一張圖）
+    if (!content.trim() && !fileIds.length) continue;
     if (content.length > PG_LIMITS.maxChars) return { err: "有訊息超過單則字數上限" };
     total += content.length;
     if (total > PG_LIMITS.maxTotal) return { err: "對話內容太長，開個新對話吧" };
-    messages.push({ role: role, content: content });
+    const msg: ChatMsg = { role: role, content: content };
+    if (fileIds.length) msg.fileIds = fileIds;
+    messages.push(msg);
   }
   if (!messages.length) return { err: "messages 不能是空的" };
   if (messages[messages.length - 1].role !== "user") return { err: "最後一則要是 user 訊息" };
@@ -192,6 +236,150 @@ export function mergeExtraBody(body: Record<string, unknown>, extra: unknown): R
   return body;
 }
 
+// ===== 圖片如何進上游 body（v2.3；這段是 CPU 上限的第三道解法）=====
+//
+// 三家都只吃 base64，但**絕不能**把 base64 交給 JSON.stringify —— 它會逐字元掃過
+// 每一個 byte 找需要跳脫的字元，而 base64 的字元集裡根本沒有任何一個需要跳脫。
+// 實測（2026-07-29，含 fetch 必付的 bytes 轉換）：
+//   整包 stringify：1 張圖 2.66ms、2 張 5.41ms、3 張 9.66ms ← 免費方案上限 10ms，爆
+//   佔位符 ＋ split/join：1 張 1.62ms、2 張 3.31ms、3 張 6.00ms（省 39%）
+//
+// 做法：組物件時圖片欄位先放一個短佔位符（U+0001IMG<n>U+0001），stringify 只掃到
+// 幾百 bytes 的小物件，然後用 split/join 把佔位符換成真正的 base64。
+// 正確性由 stringify 自己保證 —— 文字內容的引號、反斜線、換行、中文全部照它的規則跳脫，
+// 我們只動「一段保證不含特殊字元的 base64」。
+//
+// 佔位符為什麼用 U+0001：它是控制字元，正常文字打不出來，而且 cleanChat 已經把使用者
+// 內容裡的控制字元整批剝掉了（見該處註解）—— 兩道保險，誤配不可能發生。
+// split 的 pattern 取 JSON.stringify(佔位符)，拿到的是**已跳脫且帶引號**的形式
+// （U+0001 在 JSON 裡是 \u0001 六個字元），跟 stringify 實際寫進去的完全一致。
+function imgPh(i: number): string {
+  return "\u0001IMG" + i + "\u0001";
+}
+
+// mode：dataurl＝OpenAI（值是 data:<mime>;base64,<b64> 的完整 URL）
+//       raw＝Anthropic／Gemini（值就是純 base64，mime 另外有欄位）
+export function fillImages(s: string, imgs: ChatImage[], mode: "dataurl" | "raw"): string {
+  for (let i = 0; i < imgs.length; i++) {
+    const pat = JSON.stringify(imgPh(i));
+    const val =
+      mode === "dataurl" ? '"data:' + imgs[i].mime + ";base64," + imgs[i].b64 + '"' : '"' + imgs[i].b64 + '"';
+    s = s.split(pat).join(val);
+  }
+  return s;
+}
+
+// 收集器：走訪訊息時把圖片依序推進 flat 陣列，佔位符編號＝它在陣列裡的位置。
+// 三家的 body 形狀差很多，但「編號規則」統一在這裡，fillImages 才能一視同仁。
+interface ImgAcc {
+  list: ChatImage[];
+}
+function takeImgs(m: ChatMsg, acc: ImgAcc): { im: ChatImage; ph: string }[] {
+  const out: { im: ChatImage; ph: string }[] = [];
+  for (const im of (m.images || []).slice(0, PG_LIMITS.maxImgPerMsg)) {
+    out.push({ im: im, ph: imgPh(acc.list.length) });
+    acc.list.push(im);
+  }
+  return out;
+}
+
+/**
+ * 把 messages 裡的檔案編號換成實際圖片內容（就地改寫 m.images／m.content）。
+ * 回 { err } 代表整個請求該被擋下來；其他情況一律「盡量送出去」。
+ *
+ * 三條降級規則，共同的原則是 **不要因為附件的問題讓人連話都說不出來**：
+ *
+ *   1. 模型不吃圖，但使用者**這一則**就是丟了圖 → 擋下來報錯。
+ *      他明確要求看圖，靜默丟掉等於騙他（模型會憑空瞎猜，而他不知道圖沒送到）。
+ *   2. 模型不吃圖，圖在**歷史訊息**裡 → 靜默降級成文字佔位。
+ *      這發生在「聊到一半換模型」，擋下來只會讓整串舊對話再也不能用。
+ *   3. 總量超過 maxImgBytesTotal → 從**最舊**的開始降級成文字佔位。
+ *      預算是 CPU 上限反推的（見 PG_LIMITS），不是喜好問題；而最新的圖幾乎一定是
+ *      使用者正在問的那張，所以要保最新、丟最舊。
+ *
+ * 被降級的圖不會憑空消失 —— 內容裡會補一行「[已省略的圖片：檔名]」，模型知道這裡本來
+ * 有圖，使用者從對話也看得出來。
+ */
+export async function loadImages(
+  env: Env,
+  user: UserRow,
+  messages: ChatMsg[],
+  seesImages: boolean
+): Promise<{ err?: string }> {
+  const ids: number[] = [];
+  for (const m of messages) if (m.fileIds) for (const id of m.fileIds) ids.push(id);
+  if (!ids.length) return {};
+
+  const last = messages[messages.length - 1];
+  if (!seesImages && last && last.fileIds && last.fileIds.length) {
+    return { err: "這個模型看不了圖片 — 請換一個支援視覺的模型，或把圖片移除" };
+  }
+
+  // 一次撈完（只撈自己的 —— 別人的編號塞進來就是查不到，自然被當成「檔案不存在」）。
+  // 編號來自 cleanChat 的 parseInt，保證是數字，直接內插不會有注入問題。
+  const uniq = Array.from(new Set(ids)).slice(0, PG_LIMITS.maxMsgs * PG_LIMITS.maxImgPerMsg);
+  const byId = new Map<number, FileRow>();
+  try {
+    const rs = await env.DB.prepare(
+      "SELECT * FROM pg_files WHERE id IN (" + uniq.join(",") + ") AND user_id=?1"
+    )
+      .bind(user.id)
+      .all();
+    for (const r of (rs.results || []) as FileRow[]) byId.set(Number(r.id), r);
+  } catch (e) {
+    return {}; // 撈不到就當成沒有附件，讓對話照常進行
+  }
+
+  // 第一輪：從最新往回走，決定哪些留、哪些降級（先不讀內容 —— R2 讀取要平行化）
+  const want: { m: ChatMsg; rows: FileRow[] }[] = [];
+  let budget = PG_LIMITS.maxImgBytesTotal;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m.fileIds || !m.fileIds.length) continue;
+    const rows: FileRow[] = [];
+    const dropped: string[] = [];
+    for (const id of m.fileIds) {
+      const row = byId.get(id);
+      const label = (row && row.name) || "圖片";
+      if (!row || row.purged || !seesImages || Number(row.bytes) > budget) {
+        dropped.push(label);
+        continue;
+      }
+      rows.push(row);
+      budget -= Number(row.bytes) || 0;
+    }
+    if (rows.length) want.push({ m: m, rows: rows });
+    if (dropped.length) {
+      m.content = (m.content ? m.content + "\n\n" : "") + "[已省略的圖片：" + dropped.join("、") + "]";
+    }
+  }
+  if (!want.length) return {};
+
+  // 第二輪：平行讀內容。D1 路徑是直接讀欄位（零 I/O），R2 路徑則是每張一次物件讀取 ——
+  // 序列跑的話延遲會疊加，平行就只花最慢那一張的時間。
+  await Promise.all(
+    want.map(async function (w) {
+      const imgs: ChatImage[] = [];
+      const got = await Promise.all(
+        w.rows.map(function (r) {
+          return getB64(env, r);
+        })
+      );
+      for (let i = 0; i < w.rows.length; i++) {
+        const b64 = got[i];
+        if (b64) imgs.push({ mime: w.rows[i].mime, b64: b64 });
+        else {
+          // 讀不到（R2 掉了／內容剛好被清）→ 跟其他降級一樣補佔位，不讓整串對話失敗
+          w.m.content =
+            (w.m.content ? w.m.content + "\n\n" : "") + "[已省略的圖片：" + (w.rows[i].name || "圖片") + "]";
+        }
+      }
+      if (imgs.length) w.m.images = imgs;
+    })
+  );
+  return {};
+}
+
 // 把統一格式的 messages 轉成各家上游的串流請求 → { url, headers, body }
 // maxTokens（Phase K demo 用）：有帶＝三種上游都強制回覆長度上限；沒帶＝會員路徑原行為
 //（anthropic 必填、維持 PG_LIMITS.maxTokens；openai/gemini 不設限）。
@@ -226,8 +414,21 @@ export function buildUpstream(
   const rest = messages.filter(function (m) {
     return m.role !== "system";
   });
+  // 這一趟收集到的所有圖片（順序＝佔位符編號）。沒有附件時整包保持原本的純文字形狀，
+  // 一個位元組都不會變 —— 舊行為完全不受影響。
+  const acc: ImgAcc = { list: [] };
 
   if (ch.kind === "anthropic") {
+    const msgs = rest.map(function (m) {
+      const imgs = takeImgs(m, acc);
+      if (!imgs.length) return { role: m.role, content: m.content };
+      // Anthropic 官方建議圖片排在文字前面（模型先看到圖再讀問題，理解較準）
+      const parts: unknown[] = imgs.map(function (x) {
+        return { type: "image", source: { type: "base64", media_type: x.im.mime, data: x.ph } };
+      });
+      if (m.content) parts.push({ type: "text", text: m.content });
+      return { role: m.role, content: parts };
+    });
     return {
       url: ch.base_url + "/v1/messages",
       headers: {
@@ -235,39 +436,55 @@ export function buildUpstream(
         "x-api-key": ch.api_key,
         "anthropic-version": "2023-06-01"
       },
-      body: JSON.stringify(
-        mergeExtraBody(
-          {
-            model: model,
-            max_tokens: maxTokens || PG_LIMITS.maxTokens,
-            stream: true,
-            system: sys || undefined,
-            messages: rest.map(function (m) {
-              return { role: m.role, content: m.content };
-            })
-          },
-          ch.extra_body
-        )
+      body: fillImages(
+        JSON.stringify(
+          mergeExtraBody(
+            {
+              model: model,
+              max_tokens: maxTokens || PG_LIMITS.maxTokens,
+              stream: true,
+              system: sys || undefined,
+              messages: msgs
+            },
+            ch.extra_body
+          )
+        ),
+        acc.list,
+        "raw"
       )
     };
   }
   if (ch.kind === "gemini") {
     // Gemini 原生端點；金鑰只走 x-goog-api-key（多送 Authorization 會 401，中轉那邊實測過）
     const enc = encodeURIComponent(model).replace(/%2F/gi, "/");
+    const contents = rest.map(function (m) {
+      const imgs = takeImgs(m, acc);
+      // 欄位用 camelCase（inlineData／mimeType）跟同一包裡的 systemInstruction 一致 ——
+      // Gemini 兩種命名都收，混用只會讓人以為其中一種是錯的。
+      const parts: unknown[] = imgs.map(function (x) {
+        return { inlineData: { mimeType: x.im.mime, data: x.ph } };
+      });
+      // 有文字就加 text part；完全沒內容時也要補一個空的 —— Gemini 收到 parts:[] 會回 400。
+      // （只有圖沒有文字是合法的，那時 parts 已經有 inlineData，不必補。）
+      if (m.content || !parts.length) parts.push({ text: m.content });
+      return { role: m.role === "assistant" ? "model" : "user", parts: parts };
+    });
     return {
       url: ch.base_url + "/v1beta/models/" + enc + ":streamGenerateContent?alt=sse",
       headers: { "content-type": "application/json", "x-goog-api-key": ch.api_key },
-      body: JSON.stringify(
-        mergeExtraBody(
-          {
-            contents: rest.map(function (m) {
-              return { role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] };
-            }),
-            systemInstruction: sys ? { parts: [{ text: sys }] } : undefined,
-            generationConfig: maxTokens ? { maxOutputTokens: maxTokens } : undefined
-          },
-          ch.extra_body
-        )
+      body: fillImages(
+        JSON.stringify(
+          mergeExtraBody(
+            {
+              contents: contents,
+              systemInstruction: sys ? { parts: [{ text: sys }] } : undefined,
+              generationConfig: maxTokens ? { maxOutputTokens: maxTokens } : undefined
+            },
+            ch.extra_body
+          )
+        ),
+        acc.list,
+        "raw"
       )
     };
   }
@@ -276,7 +493,17 @@ export function buildUpstream(
   const oaMsgs: ChatMsg[] = chSys
     ? ([{ role: "system", content: chSys }] as ChatMsg[]).concat(messages)
     : messages;
-  const body: Record<string, unknown> = { model: model, stream: true, messages: oaMsgs };
+  const outMsgs = oaMsgs.map(function (m) {
+    const imgs = takeImgs(m, acc);
+    // 沒有附件的訊息維持「content 是字串」的原形狀 —— 陣列形式雖然也合法，
+    // 但 custom 渠道（自架／小服務）不一定支援，沒必要為了統一而冒相容性的險。
+    if (!imgs.length) return { role: m.role, content: m.content };
+    const parts: unknown[] = [];
+    if (m.content) parts.push({ type: "text", text: m.content });
+    for (const x of imgs) parts.push({ type: "image_url", image_url: { url: x.ph } });
+    return { role: m.role, content: parts };
+  });
+  const body: Record<string, unknown> = { model: model, stream: true, messages: outMsgs };
   if (maxTokens) body.max_tokens = maxTokens;
   // 串流尾端要上游回報 token 用量（計量用）。只對 kind='openai' 加 —
   // custom 常是本地／自架服務，可能拒收不認識的欄位（記在 DEBT）。
@@ -284,7 +511,7 @@ export function buildUpstream(
   return {
     url: ch.base_url + "/v1/chat/completions",
     headers: { "content-type": "application/json", authorization: "Bearer " + ch.api_key },
-    body: JSON.stringify(mergeExtraBody(body, ch.extra_body))
+    body: fillImages(JSON.stringify(mergeExtraBody(body, ch.extra_body)), acc.list, "dataurl")
   };
 }
 
@@ -367,6 +594,22 @@ export function extractFull(kind: string, j: any): string {
   } catch (e) {
     return "";
   }
+}
+
+// relay_channels.vision_models（逗號分隔）→ 陣列（migration 0007）。
+// 空＝這個管道沒有任何模型吃得下圖片，附件鈕的圖片選項會是灰的。
+export function chVisionModels(ch: { vision_models?: unknown } | null | undefined): string[] {
+  return String((ch && ch.vision_models) || "")
+    .split(",")
+    .map(function (s) {
+      return s.trim();
+    })
+    .filter(Boolean);
+}
+
+/** 這個管道的這個模型吃不吃圖。管理員沒填 vision_models＝一律不吃（安全預設）。 */
+export function modelSeesImages(ch: { vision_models?: unknown } | null | undefined, model: string): boolean {
+  return chVisionModels(ch).indexOf(String(model || "").trim()) >= 0;
 }
 
 // relay_channels.models（逗號分隔）→ 陣列

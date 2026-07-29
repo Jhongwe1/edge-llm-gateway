@@ -161,15 +161,26 @@ export async function seedChannel(over?: Partial<ChannelRow>): Promise<ChannelRo
       base_url: "https://api.example.com",
       api_key: "sk-upstream-secret",
       models: "test-model",
+      vision_models: "", // v2.3：空＝這個渠道的模型都看不了圖（安全預設，與正式行為一致）
       enabled: 1
     },
     over || {}
   );
   const r = await testEnv.DB.prepare(
-    "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,enabled,created_at) " +
-      "VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
+    "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,vision_models,enabled,created_at) " +
+      "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
   )
-    .bind(o.slug, o.name, o.kind, o.base_url, o.api_key, o.models, o.enabled, new Date().toISOString())
+    .bind(
+      o.slug,
+      o.name,
+      o.kind,
+      o.base_url,
+      o.api_key,
+      o.models,
+      o.vision_models,
+      o.enabled,
+      new Date().toISOString()
+    )
     .run();
   const row = await testEnv.DB.prepare("SELECT * FROM relay_channels WHERE id=?1")
     .bind(r.meta.last_row_id)

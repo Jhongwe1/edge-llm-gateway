@@ -60,6 +60,8 @@ import {
   onRequestPut as apiPgConvPut,
   onRequestDelete as apiPgConvDel
 } from "./routes/api/playground/conversations/[id].js";
+import { onRequestPost as apiPgFileUp } from "./routes/api/playground/files/index.js";
+import { onRequestGet as apiPgFileGet } from "./routes/api/playground/files/[id].js";
 
 // —— 會員自助 API ——
 import { onRequestPost as acctKeyPost, onRequestDelete as acctKeyDel } from "./routes/api/account/key.js";
@@ -158,6 +160,8 @@ export const ROUTES: Array<[string, MethodMap]> = [
   ["/api/playground/chat", { POST: apiPgChat }],
   ["/api/playground/conversations", { GET: apiPgConvList }],
   ["/api/playground/conversations/:id", { GET: apiPgConvGet, PUT: apiPgConvPut, DELETE: apiPgConvDel }],
+  ["/api/playground/files", { POST: apiPgFileUp }],
+  ["/api/playground/files/:id", { GET: apiPgFileGet }],
 
   // auth
   ["/auth/login", { GET: loginGet, POST: loginPost }],

@@ -9,6 +9,8 @@ import {
   extractReasoning,
   extractFull,
   chModels,
+  chVisionModels,
+  modelSeesImages,
   mergeExtraBody,
   PG_LIMITS,
   PG_DEFAULT_SYSTEM
@@ -391,5 +393,210 @@ describe("chModels", () => {
     expect(chModels({ models: " a , b ,,c " })).toEqual(["a", "b", "c"]);
     expect(chModels({ models: "" })).toEqual([]);
     expect(chModels(null)).toEqual([]);
+  });
+});
+
+/* ===================== 附件（v2.3） ===================== */
+
+describe("cleanChat — files 欄位與控制字元", () => {
+  const base = (m: any) => ({ channel: "c", model: "m", messages: [m] });
+
+  it("files 收成 fileIds（正整數、去掉垃圾、上限 maxImgPerMsg）", () => {
+    const v = cleanChat(base({ role: "user", content: "看圖", files: [3, "7", 0, -2, "x", 9] }));
+    expect(v.err).toBeUndefined();
+    expect(v.messages![0].fileIds).toEqual([3, 7, 9]);
+  });
+  it("超過單則上限就截斷", () => {
+    const many = Array.from({ length: PG_LIMITS.maxImgPerMsg + 3 }, (_, i) => i + 1);
+    const v = cleanChat(base({ role: "user", content: "x", files: many }));
+    expect(v.messages![0].fileIds!.length).toBe(PG_LIMITS.maxImgPerMsg);
+  });
+  it("只有圖片、沒有文字的訊息是合法的", () => {
+    const v = cleanChat(base({ role: "user", content: "", files: [5] }));
+    expect(v.err).toBeUndefined();
+    expect(v.messages!.length).toBe(1);
+    expect(v.messages![0].content).toBe("");
+    expect(v.messages![0].fileIds).toEqual([5]);
+  });
+  it("沒文字也沒檔案的訊息照舊被略過", () => {
+    const v = cleanChat({ channel: "c", model: "m", messages: [{ role: "user", content: "  " }] });
+    expect(v.err).toBe("messages 不能是空的");
+  });
+  // 這條是 fillImages 快路徑的安全前提：使用者若能把 U+0001 送進 content，
+  // 就有可能偽造圖片佔位符、讓自己的文字被替換成別的圖（或破壞 JSON）。
+  it("控制字元被剝掉（含當佔位符用的 U+0001），但保留 \n \r \t", () => {
+    const v = cleanChat(base({ role: "user", content: "a\u0001IMG0\u0001b\u0000c\u001fd\ne\tf" }));
+    expect(v.messages![0].content).toBe("aIMG0bcd\ne\tf");
+    expect(v.messages![0].content.indexOf("\u0001")).toBe(-1);
+  });
+});
+
+describe("buildUpstream — 圖片（三家格式）", () => {
+  const IMG = { mime: "image/webp", b64: "UklGRhIAAABXRUJQ" };
+  const withImg = (): ChatMsg[] => [{ role: "user", content: "這是什麼？", images: [{ ...IMG }] }];
+
+  it("openai：content 變成 [text, image_url]，值是 data URL", () => {
+    const ch = { kind: "openai", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const b = JSON.parse(buildUpstream(ch, "gpt-x", withImg()).body);
+    const last = b.messages[b.messages.length - 1];
+    expect(Array.isArray(last.content)).toBe(true);
+    expect(last.content[0]).toEqual({ type: "text", text: "這是什麼？" });
+    expect(last.content[1].image_url.url).toBe("data:image/webp;base64," + IMG.b64);
+  });
+
+  it("anthropic：image block 排在文字前面，data 是純 base64", () => {
+    const ch = { kind: "anthropic", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const b = JSON.parse(buildUpstream(ch, "claude-x", withImg()).body);
+    const last = b.messages[b.messages.length - 1];
+    expect(last.content[0].type).toBe("image");
+    expect(last.content[0].source).toEqual({
+      type: "base64",
+      media_type: "image/webp",
+      data: IMG.b64
+    });
+    expect(last.content[1]).toEqual({ type: "text", text: "這是什麼？" });
+  });
+
+  it("gemini：inlineData + mimeType；parts 永遠不會是空的", () => {
+    const ch = { kind: "gemini", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const b = JSON.parse(buildUpstream(ch, "g-x", withImg()).body);
+    expect(b.contents[0].parts[0].inlineData).toEqual({ mimeType: "image/webp", data: IMG.b64 });
+    expect(b.contents[0].parts[1]).toEqual({ text: "這是什麼？" });
+    // 只有圖、沒有文字 → 就只有 inlineData 一個 part（合法，不必補空的 text）
+    const only = JSON.parse(
+      buildUpstream(ch, "g-x", [{ role: "user", content: "", images: [{ ...IMG }] }]).body
+    );
+    expect(only.contents[0].parts.length).toBe(1);
+    expect(only.contents[0].parts[0].inlineData).toBeTruthy();
+    // 沒圖也沒文字 → 補一個空 text，避免送出 parts:[]（Gemini 會回 400）
+    const none = JSON.parse(buildUpstream(ch, "g-x", [{ role: "user", content: "" }]).body);
+    expect(none.contents[0].parts).toEqual([{ text: "" }]);
+  });
+
+  it("沒有附件時，body 與改版前一模一樣（content 保持字串）", () => {
+    const ch = { kind: "openai", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const b = JSON.parse(buildUpstream(ch, "gpt-x", [{ role: "user", content: "純文字" }]).body);
+    expect(typeof b.messages[b.messages.length - 1].content).toBe("string");
+  });
+
+  it("多張圖跨多則訊息：每張都對應到自己那一張，不會錯位", () => {
+    const ch = { kind: "openai", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const msgs: ChatMsg[] = [
+      { role: "user", content: "第一", images: [{ mime: "image/png", b64: "AAAA" }] },
+      { role: "assistant", content: "嗯" },
+      {
+        role: "user",
+        content: "第二",
+        images: [
+          { mime: "image/jpeg", b64: "BBBB" },
+          { mime: "image/gif", b64: "CCCC" }
+        ]
+      }
+    ];
+    const b = JSON.parse(buildUpstream(ch, "gpt-x", msgs).body);
+    const m1 = b.messages[b.messages.length - 3];
+    const m3 = b.messages[b.messages.length - 1];
+    expect(m1.content[1].image_url.url).toBe("data:image/png;base64,AAAA");
+    expect(m3.content[1].image_url.url).toBe("data:image/jpeg;base64,BBBB");
+    expect(m3.content[2].image_url.url).toBe("data:image/gif;base64,CCCC");
+  });
+
+  // 這是整個附件功能裡最該被釘住的一條：為了避開 JSON.stringify 掃過 base64 的 CPU 成本
+  // （1 張圖 2.66ms、3 張 9.66ms，而免費方案上限是 10ms），body 是用「佔位符 ＋ split/join」
+  // 組出來的。這個手法只有在「輸出與直接 stringify 逐位元組相同」的前提下才站得住。
+  it("佔位符組法的輸出＝直接 stringify 的輸出（逐位元組相同）", () => {
+    const tricky = '有 "引號"、\\反斜線\\、換行\n、tab\t、中文與 emoji 🎨、還有 </script>';
+    const b64a = "AAAABBBBCCCC";
+    const b64b = "DDDDEEEEFFFF";
+    const mk = (): ChatMsg[] => [
+      {
+        role: "user",
+        content: tricky,
+        images: [
+          { mime: "image/webp", b64: b64a },
+          { mime: "image/png", b64: b64b }
+        ]
+      }
+    ];
+
+    // openai：手工組出「當初若直接 stringify 會長怎樣」，跟實際輸出比對
+    const oa = { kind: "openai", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const wantOa = JSON.stringify({
+      model: "m",
+      stream: true,
+      messages: [
+        { role: "system", content: PG_DEFAULT_SYSTEM },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: tricky },
+            { type: "image_url", image_url: { url: "data:image/webp;base64," + b64a } },
+            { type: "image_url", image_url: { url: "data:image/png;base64," + b64b } }
+          ]
+        }
+      ],
+      stream_options: { include_usage: true }
+    });
+    expect(buildUpstream(oa, "m", mk()).body).toBe(wantOa);
+
+    // anthropic：圖片排在文字前面
+    const an = { kind: "anthropic", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const wantAn = JSON.stringify({
+      model: "m",
+      max_tokens: PG_LIMITS.maxTokens,
+      stream: true,
+      system: PG_DEFAULT_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/webp", data: b64a } },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: b64b } },
+            { type: "text", text: tricky }
+          ]
+        }
+      ]
+    });
+    expect(buildUpstream(an, "m", mk()).body).toBe(wantAn);
+
+    // gemini
+    const ge = { kind: "gemini", base_url: "https://x", api_key: "k" } as ChannelRow;
+    const wantGe = JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { inlineData: { mimeType: "image/webp", data: b64a } },
+            { inlineData: { mimeType: "image/png", data: b64b } },
+            { text: tricky }
+          ]
+        }
+      ],
+      systemInstruction: { parts: [{ text: PG_DEFAULT_SYSTEM }] }
+    });
+    expect(buildUpstream(ge, "m", mk()).body).toBe(wantGe);
+
+    // 佔位符一個都不能留（漏替換＝上游收到 \u0001IMG0 這種東西，而且錯得無聲無息）
+    for (const ch of [oa, an, ge]) {
+      expect(buildUpstream(ch, "m", mk()).body.indexOf("\u0001")).toBe(-1);
+    }
+  });
+});
+
+describe("chVisionModels / modelSeesImages", () => {
+  it("逗號分隔 → 陣列", () => {
+    expect(chVisionModels({ vision_models: " a , b ,,c " })).toEqual(["a", "b", "c"]);
+    expect(chVisionModels({ vision_models: "" })).toEqual([]);
+    expect(chVisionModels(null)).toEqual([]);
+  });
+  it("沒設定＝一律不支援（安全預設）", () => {
+    expect(modelSeesImages(null, "gpt-4o")).toBe(false);
+    expect(modelSeesImages({ vision_models: "" }, "gpt-4o")).toBe(false);
+  });
+  it("有列進去才算支援，且是精確比對", () => {
+    const ch = { vision_models: "gpt-4o,claude-3" };
+    expect(modelSeesImages(ch, "gpt-4o")).toBe(true);
+    expect(modelSeesImages(ch, "gpt-4")).toBe(false); // 前綴相同也不算
+    expect(modelSeesImages(ch, "GPT-4O")).toBe(false); // 大小寫敏感（模型名本來就是）
   });
 });

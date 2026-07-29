@@ -61,6 +61,7 @@ export interface RelayChannelInput {
   models: string;
   system_prompt: string;
   extra_body: string;
+  vision_models: string;
   enabled: number;
   api_key?: string;
 }
@@ -112,6 +113,16 @@ export function cleanChannel(b: any): CleanRelayChannelResult {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return { err: "額外請求參數要是 JSON 物件（{ … }），不能是陣列或單一數值" };
   }
+  // 吃得下圖片的模型（選填，migration 0007）。必須是 models 的子集 —— 填了一個沒開放的
+  // 模型名，多半是打錯字，而後果是會員按了附件鈕、送出才被上游打回來。
+  // 這種錯誤要在管理員按「儲存」的當下就講清楚，不要留到會員踩到。
+  const vm = cleanModels(b.vision_models);
+  if (vm.err !== undefined) return { err: vm.err };
+  for (const one of vm.list) {
+    if (m.list.indexOf(one) < 0) {
+      return { err: "視覺模型「" + one + "」不在這個渠道的模型清單裡 — 請先把它加進上面的模型欄位" };
+    }
+  }
   const ch: RelayChannelInput = {
     slug: slug,
     name: name,
@@ -120,6 +131,7 @@ export function cleanChannel(b: any): CleanRelayChannelResult {
     models: m.list.join(","),
     system_prompt: sysPrompt,
     extra_body: extraBody,
+    vision_models: vm.list.join(","),
     enabled: b.enabled === false || b.enabled === 0 ? 0 : 1
   };
   if (b.api_key !== undefined)
@@ -139,6 +151,13 @@ export function maskRow(r: any) {
     models: modelList(r),
     system_prompt: r.system_prompt || "", // 管理員專用端點才回這欄；會員的 /api/relay/channels 是指定欄位 SELECT，不會外洩
     extra_body: r.extra_body || "", // 同上，只有管理員看得到
+    // 陣列形式（跟 models 一致）—— 管道視窗的 textarea 直接 join("\n") 就能顯示
+    vision_models: String(r.vision_models || "")
+      .split(",")
+      .map(function (s: string) {
+        return s.trim();
+      })
+      .filter(Boolean),
     enabled: r.enabled,
     created_at: r.created_at,
     has_key: !!r.api_key,
@@ -177,7 +196,7 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const r = await env.DB.prepare(
-        "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,system_prompt,extra_body,enabled,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+        "INSERT INTO relay_channels (slug,name,kind,base_url,api_key,models,system_prompt,extra_body,vision_models,enabled,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
       )
         .bind(
           slug,
@@ -188,6 +207,7 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
           c.ch.models,
           c.ch.system_prompt,
           c.ch.extra_body,
+          c.ch.vision_models,
           c.ch.enabled,
           new Date().toISOString()
         )

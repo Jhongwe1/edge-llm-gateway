@@ -181,7 +181,7 @@ describe("backupToR2", () => {
 });
 
 describe("purgeOld", () => {
-  it("req_log 90 天、sessions 過期、pg_messages 360 天；新的留下", async () => {
+  it("req_log 90 天、sessions 過期、visits 180 天", async () => {
     const u = await seedUser();
     const now = new Date("2026-01-03T12:00:00Z");
     const old = (d: number): string => new Date(now.getTime() - d * 86400e3).toISOString();
@@ -193,29 +193,101 @@ describe("purgeOld", () => {
     await env.DB.prepare("INSERT INTO sessions (sid,user_id,created_at,expires_at) VALUES ('live',?1,?2,?3)")
       .bind(u.id, old(1), new Date(now.getTime() + 86400e3).toISOString())
       .run();
-    await env.DB.prepare(
-      "INSERT INTO pg_conversations (user_id,title,created_at,updated_at) VALUES (?1,'t',?2,?2)"
-    )
-      .bind(u.id, old(400))
-      .run();
-    await env.DB.prepare(
-      "INSERT INTO pg_messages (conv_id,role,content,created_at) VALUES (1,'user','舊',?1)"
-    )
-      .bind(old(361))
-      .run();
-    await env.DB.prepare(
-      "INSERT INTO pg_messages (conv_id,role,content,created_at) VALUES (1,'user','新',?1)"
-    )
-      .bind(old(300))
-      .run();
+    // visits 在 v2.3 之前完全沒有清理機制（2026-07-29 補）
+    await env.DB.prepare("INSERT INTO visits (ts,host,path) VALUES (?1,'h','/old')").bind(old(181)).run();
+    await env.DB.prepare("INSERT INTO visits (ts,host,path) VALUES (?1,'h','/new')").bind(old(179)).run();
+
     const note = await purgeOld(env, now);
     expect(note).toContain("req_log −1");
+    expect(note).toContain("visits −1");
     const reqs = (await env.DB.prepare("SELECT * FROM req_log").all()).results as any[];
     expect(reqs.length).toBe(1);
     const sess = (await env.DB.prepare("SELECT sid FROM sessions").all()).results as any[];
     expect(sess.map((s) => s.sid)).toEqual(["live"]);
+    const vs = (await env.DB.prepare("SELECT path FROM visits").all()).results as any[];
+    expect(vs.map((v) => v.path)).toEqual(["/new"]);
+  });
+
+  // v2.3 的行為變更：以前是「訊息滿 360 天就刪，對話殼永遠留著」——
+  // 結果是一年後 History 裡開始堆積點進去空白的對話。現在改成整則對話一起過期。
+  it("對話過期＝殼跟內容同進同出（含附件）；還在用的對話不受影響", async () => {
+    const u = await seedUser();
+    const now = new Date("2026-01-03T12:00:00Z");
+    const old = (d: number): string => new Date(now.getTime() - d * 86400e3).toISOString();
+    // 過期對話（361 天沒更新）
+    const c1 = await env.DB.prepare(
+      "INSERT INTO pg_conversations (user_id,title,created_at,updated_at) VALUES (?1,'舊對話',?2,?2)"
+    )
+      .bind(u.id, old(361))
+      .run();
+    const id1 = c1.meta.last_row_id;
+    await env.DB.prepare(
+      "INSERT INTO pg_messages (conv_id,role,content,created_at) VALUES (?1,'user','舊',?2)"
+    )
+      .bind(id1, old(361))
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO pg_files (user_id,conv_id,msg_id,kind,mime,name,bytes,storage,b64,purged,created_at) " +
+        "VALUES (?1,?2,1,'image','image/webp','a.webp',100,'d1','AAAA',0,?3)"
+    )
+      .bind(u.id, id1, old(361))
+      .run();
+    // 還活著的對話（359 天前建、但最近有更新）＋一則很舊的訊息
+    const c2 = await env.DB.prepare(
+      "INSERT INTO pg_conversations (user_id,title,created_at,updated_at) VALUES (?1,'活的',?2,?3)"
+    )
+      .bind(u.id, old(400), old(2))
+      .run();
+    const id2 = c2.meta.last_row_id;
+    await env.DB.prepare(
+      "INSERT INTO pg_messages (conv_id,role,content,created_at) VALUES (?1,'user','很舊',?2)"
+    )
+      .bind(id2, old(390))
+      .run();
+
+    const note = await purgeOld(env, now);
+    expect(note).toContain("對話 −1");
+    const convs = (await env.DB.prepare("SELECT title FROM pg_conversations").all()).results as any[];
+    expect(convs.map((c) => c.title)).toEqual(["活的"]);
+    // 過期對話的訊息與附件一起走；活著的對話裡那則 390 天前的訊息**留著**
     const msgs = (await env.DB.prepare("SELECT content FROM pg_messages").all()).results as any[];
-    expect(msgs.map((m) => m.content)).toEqual(["新"]);
+    expect(msgs.map((m) => m.content)).toEqual(["很舊"]);
+    const files = (await env.DB.prepare("SELECT id FROM pg_files").all()).results as any[];
+    expect(files.length).toBe(0);
+  });
+
+  it("孤兒附件（上傳了沒送出）超過 24 小時就清掉；未滿的留著", async () => {
+    const u = await seedUser();
+    const now = new Date("2026-01-03T12:00:00Z");
+    const hrsAgo = (h: number): string => new Date(now.getTime() - h * 3600e3).toISOString();
+    const ins = async (name: string, at: string): Promise<void> => {
+      await env.DB.prepare(
+        "INSERT INTO pg_files (user_id,conv_id,msg_id,kind,mime,name,bytes,storage,b64,purged,created_at) " +
+          "VALUES (?1,NULL,NULL,'image','image/webp',?2,100,'d1','AAAA',0,?3)"
+      )
+        .bind(u.id, name, at)
+        .run();
+    };
+    await ins("stale.webp", hrsAgo(25));
+    await ins("fresh.webp", hrsAgo(2));
+    const note = await purgeOld(env, now);
+    expect(note).toContain("孤兒附件 −1");
+    const left = (await env.DB.prepare("SELECT name FROM pg_files").all()).results as any[];
+    expect(left.map((f) => f.name)).toEqual(["fresh.webp"]);
+  });
+
+  it("孤兒訊息（對話已不存在）一併清掉", async () => {
+    const now = new Date("2026-01-03T12:00:00Z");
+    await env.DB.prepare(
+      "INSERT INTO pg_messages (conv_id,role,content,created_at) VALUES (99999,'user','沒主人',?1)"
+    )
+      .bind(now.toISOString())
+      .run();
+    const note = await purgeOld(env, now);
+    expect(note).toContain("孤兒訊息 −1");
+    const msgs = (await env.DB.prepare("SELECT content FROM pg_messages WHERE conv_id=99999").all())
+      .results as any[];
+    expect(msgs.length).toBe(0);
   });
 });
 

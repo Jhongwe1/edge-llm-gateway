@@ -309,11 +309,54 @@ paths:
         "200": { description: "{ ok, title }" }
     delete:
       tags: [Playground]
-      summary: 刪除對話（連同訊息）
+      summary: 刪除對話（連同訊息與附件）
       security: [{ sessionCookie: [] }, { adminToken: [] }]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         "200": { description: "{ ok }" }
+
+  /api/playground/files:
+    post:
+      tags: [Playground]
+      summary: 上傳附件圖片（本體＝raw base64，非 JSON）
+      description: >
+        本體直接是 base64 字串（Content-Type: text/plain），中繼資料走 query。
+        刻意不包成 JSON — 伺服器全程不編碼也不解碼，內容原封存下、原封送給上游，
+        免費方案 10ms CPU 才撐得住（包成 JSON 的解析成本是 raw 的 4.7 倍）。
+        回傳的 id 用在 /api/playground/chat 的 messages[].files。
+        體驗模式（未登入）也可上傳，吃同一套 demo 限流與 demo:public 的容量配額。
+      security: [{ sessionCookie: [] }, { adminToken: [] }, {}]
+      parameters:
+        - {
+            name: mime,
+            in: query,
+            required: true,
+            schema: { type: string, enum: [image/jpeg, image/png, image/webp, image/gif] }
+          }
+        - { name: name, in: query, schema: { type: string, maxLength: 120 }, description: 原始檔名（顯示用） }
+        - { name: w, in: query, schema: { type: integer }, description: 像素寬 }
+        - { name: h, in: query, schema: { type: integer }, description: 像素高 }
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema: { type: string, description: "base64 字串（不含 data: 前綴）" }
+      responses:
+        "200": { description: "{ id, mime, name, bytes, w, h }" }
+        "400": { description: 空的或不是合法 base64 }
+        "413": { description: 超過單檔上限，或個人／全站容量已滿 }
+        "415": { description: 格式不支援，或宣告的 mime 與實際檔頭不符 }
+  /api/playground/files/{id}:
+    get:
+      tags: [Playground]
+      summary: 讀回附件圖片（二進位，翻歷史對話時用）
+      description: 只能讀自己的；體驗模式上傳的檔案僅管理員可讀。內容不可變，回應可長期快取。
+      security: [{ sessionCookie: [] }, { adminToken: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { description: 圖片二進位（Content-Type 為該檔的 mime） }
+        "404": { description: 不存在或不是自己的 }
+        "410": { description: 內容已被淘汰／過期清除（中繼資料仍在，前端畫「檔案已刪除」） }
 
   # ===== 會員自助 =====
   /api/account/key:

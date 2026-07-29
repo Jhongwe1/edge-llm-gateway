@@ -5,6 +5,8 @@
 import { json } from "../../../../lib/site.js";
 import { pgUser, dumbCfg } from "../../../../lib/playground.js";
 import { isAdminUser } from "../../../../lib/auth.js";
+import { deleteFiles } from "../../../../lib/filestore.js";
+import type { FileRow } from "../../../../lib/filestore.js";
 import type { Env, Row, RouteCtx, UserRow } from "../../../../types.js";
 
 async function ownConv(env: Env, user: UserRow, params: RouteCtx["params"]): Promise<Row | null> {
@@ -35,7 +37,20 @@ export async function onRequestGet({ request, env, params }: RouteCtx): Promise<
       (conv as Row).model = "";
       for (const m of messages) m.model = "";
     }
-    return json({ conv: conv, messages: messages });
+    // 附件（v2.3）：一次撈完整串對話的檔案，前端自己按 msg_id 分組掛回訊息上。
+    // 只回中繼資料，內容要另外打 /api/playground/files/<id>（那條路徑才有 atob 的成本，
+    // 而且瀏覽器會快取住 —— 翻同一則舊對話第二次就不必再下載）。
+    // purged=1 的照樣回，前端據此畫「檔案已刪除」而不是憑空少一格。
+    let files: Row[] = [];
+    try {
+      const fr = await env.DB.prepare(
+        "SELECT id,msg_id,mime,name,bytes,w,h,purged FROM pg_files WHERE conv_id=?1 ORDER BY id LIMIT 200"
+      )
+        .bind(conv.id)
+        .all();
+      files = (fr.results || []) as Row[];
+    } catch (e) {}
+    return json({ conv: conv, messages: messages, files: files });
   } catch (e: any) {
     return json({ error: "query-failed", detail: String((e && e.message) || e) }, 500);
   }
@@ -73,6 +88,13 @@ export async function onRequestDelete({ request, env, params }: RouteCtx): Promi
   const conv = await ownConv(env, who.user, params);
   if (!conv) return json({ error: "not-found", hint: "找不到這個對話" }, 404);
   try {
+    // 附件先刪（v2.3）：deleteFiles 會順手清掉 R2 物件 —— 只 DELETE D1 的話，
+    // R2 那邊會留下永遠沒人引用、也永遠不會被發現的垃圾物件（照樣佔 10GB 額度）。
+    // 撈不到或刪不掉都不擋住刪對話：孤兒檔案還有每日 cron 那道保險。
+    try {
+      const fr = await env.DB.prepare("SELECT * FROM pg_files WHERE conv_id=?1").bind(conv.id).all();
+      await deleteFiles(env, (fr.results || []) as FileRow[]);
+    } catch (e) {}
     await env.DB.batch([
       env.DB.prepare("DELETE FROM pg_messages WHERE conv_id=?1").bind(conv.id),
       env.DB.prepare("DELETE FROM pg_conversations WHERE id=?1").bind(conv.id)
