@@ -252,14 +252,17 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   // 站台預設系統提示詞只在「這個管道自己沒填」時才需要查 — 有填的話那一查是純浪費，
   // 免費方案的 10ms CPU 與子請求都省一點是一點。
   const defSys = String(ch.system_prompt || "").trim() ? "" : await pgDefaultSystem(env);
-  // 量 buildUpstream 花掉多久（migration 0010 的 build_ms）。放寬圖片總量上限之後，
-  // 這是唯一能回答「多大的量會把 10ms CPU 吃掉」的線上數據 —— 真的爆掉時 isolate
-  // 被直接殺掉、什麼都寫不進去（ADR-0011），所以只能從**成功案例**的分佈往上推。
-  // 註：Workers 的 Date.now() 只在 I/O 後前進，而 buildUpstream 全程無 I/O，
-  //     所以這個差值量到的就是純 CPU 時間，不含等待。
-  const tBuild = Date.now();
+  // ⚠️ 這裡**量不到** buildUpstream 的 CPU 時間，不要再試（2026-07-30 實測踩過）。
+  // Workers 為了防時序攻擊，Date.now()／performance.now() **只在 I/O 之後才前進**；
+  // buildUpstream 全程沒有 I/O，所以前後兩次讀到的是同一個值，差值**恆為 0**。
+  // 線上實測：2.15MB 的圖（≈2.9MB base64，照舊斜率該是 ~6ms）回報 build_ms=0。
+  //
+  // 想知道真正的 CPU 時間只有兩條路，都在 Worker 外面：
+  //   wrangler tail（每個請求會印 CPU time）／Cloudflare dashboard 的 Workers 分析。
+  // 站內能拿到的替代訊號是「這趟有沒有活著跑完」—— CPU 燒穿時 isolate 直接被殺，
+  // req_log 根本不會有這一列。所以 img_bytes 有值＝那個量級活下來了，
+  // 這比一個假的毫秒數有用得多（見 migration 0010 的註解）。
   const up = buildUpstream(ch, v.model, v.messages, (demo && demo.maxTokens) || undefined, defSys);
-  const buildMs = Date.now() - tBuild;
   const t0 = Date.now();
   let resp: Response;
   try {
@@ -614,10 +617,13 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
             ttfb,
             usage.tokens_in,
             usage.tokens_out,
-            // 沒帶圖的請求兩欄都留 NULL —— 之後查分佈時 WHERE img_bytes IS NOT NULL
+            // 沒帶圖的請求留 NULL —— 之後查分佈時 WHERE img_bytes IS NOT NULL
             // 就直接把純文字那些濾掉了
             imgLoad.imgBytes == null ? null : imgLoad.imgBytes,
-            imgLoad.imgBytes == null ? null : buildMs
+            // build_ms 永遠是 NULL：Worker 裡量不到 CPU 時間（理由見上面 buildUpstream
+            // 前的註解）。欄位留著不刪，是為了讓「已經試過、此路不通」這件事留在 schema 上，
+            // 免得哪天有人又想在這裡塞一個 Date.now() 差值。
+            null
           )
         );
         await env.DB.batch(stmts);

@@ -7,8 +7,13 @@
 --
 -- 所以改成正面記錄成功案例的成本分佈：
 --   img_bytes ── 這一趟所有圖片的原始 bytes 總和
---   build_ms  ── buildUpstream（組上游請求本體）花掉的毫秒
--- 兩欄都可以是 NULL：沒帶圖的請求不填，舊資料也維持 NULL。
+--   build_ms  ── ⚠️ **永遠是 NULL，這個想法行不通**（2026-07-30 實測）。
+--                原本想記 buildUpstream 花掉的毫秒，但 Workers 為了防時序攻擊，
+--                Date.now()／performance.now() 只在 I/O 之後才前進，而 buildUpstream
+--                全程無 I/O → 差值恆為 0。線上實測 2.15MB 的圖回報 build_ms=0
+--                （照舊斜率該是 ~6ms）。欄位刻意留著，讓「此路不通」留在 schema 上。
+--                真要 CPU 數字只能靠 wrangler tail 或 dashboard 分析。
+-- 沒帶圖的請求 img_bytes 也留 NULL，舊資料同樣是 NULL。
 --
 -- 怎麼用這份數據：
 --   1. 成功案例：SELECT img_bytes, build_ms FROM req_log WHERE img_bytes IS NOT NULL

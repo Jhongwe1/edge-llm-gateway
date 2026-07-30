@@ -492,7 +492,8 @@ describe("聊天串接", () => {
       .bind(u.id)
       .first<any>();
     expect(row.img_bytes).toBe(900); // 3 張 × 300 bytes
-    expect(row.build_ms).not.toBeNull();
+    // build_ms 永遠是 NULL —— Worker 裡量不到 CPU 時間（2026-07-30 實測，見 chat.ts 註解）
+    expect(row.build_ms).toBeNull();
   });
 
   it("沒帶圖的請求 img_bytes 留 NULL（查分佈時直接濾掉純文字）", async () => {
