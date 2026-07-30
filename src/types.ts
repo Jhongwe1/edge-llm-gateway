@@ -4,12 +4,16 @@
 // 直接取自 D1（欄位型別鬆），所以 Row 型別是描述性的、允許 index 存取。
 
 import type { RateLimiter } from "./do/rate-limiter.js";
+import type { PgStream } from "./do/pg-stream.js";
 
 // wrangler.toml 綁定 + secrets。functions/handler 只碰得到這些。
 export interface Env {
   DB: D1Database;
   ASSETS: { fetch: (req: Request) => Promise<Response> };
   RATE_LIMITER?: DurableObjectNamespace<RateLimiter>; // Phase H 限流器 DO（可選：沒綁定就走 D1 降級路徑）
+  // v2.5_DO Playground 串流 DO（ADR-0015）。**可選**：沒綁定就退回「在 Worker 裡串流」＝v2.4 行為
+  // （長回覆會再撞免費方案 10ms CPU 上限，但站台照跑）。settings.pg_do='0' 也是同一條退路。
+  PG_STREAM?: DurableObjectNamespace<PgStream>;
   BACKUPS?: R2Bucket; // Phase I 備份桶（可選：沒綁定＝備份 job 跳過）
   // v2.3 Playground 附件桶（可選）。**綁定在＝新附件寫 R2，沒綁定＝寫 D1 的 b64 欄位**，
   // 判斷寫在 lib/filestore.ts activeStore()。每一列各自記自己存在哪（pg_files.storage），

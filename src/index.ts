@@ -6,8 +6,10 @@ import { handle } from "./router.js";
 import { runCron } from "./cron.js";
 import type { Env } from "./types.js";
 
-// Durable Object 類別必須從進入點匯出，wrangler 的 DO binding 才找得到（Phase H 限流器）
+// Durable Object 類別必須從進入點匯出，wrangler 的 DO binding 才找得到
+// （Phase H 限流器；v2.5_DO 的 Playground 串流引擎 —— 見 docs/adr/0015）
 export { RateLimiter } from "./do/rate-limiter.js";
+export { PgStream } from "./do/pg-stream.js";
 
 export default {
   fetch(request: Request, env: Env, exec: ExecutionContext): Promise<Response> {

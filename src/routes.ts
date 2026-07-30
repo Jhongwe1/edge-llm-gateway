@@ -54,7 +54,6 @@ import { onRequestGet as apiPageGet } from "./routes/api/pages/[slug].js";
 import { onRequestGet as apiRelayChannels } from "./routes/api/relay/channels.js";
 import { onRequestGet as apiPgModels } from "./routes/api/playground/models.js";
 import { onRequestPost as apiPgChat } from "./routes/api/playground/chat.js";
-import { onRequestPost as apiPgChatSave } from "./routes/api/playground/chat/save.js";
 import { onRequestGet as apiPgConvList } from "./routes/api/playground/conversations/index.js";
 import {
   onRequestGet as apiPgConvGet,
@@ -159,7 +158,6 @@ export const ROUTES: Array<[string, MethodMap]> = [
   ["/api/relay/channels", { GET: apiRelayChannels }],
   ["/api/playground/models", { GET: apiPgModels }],
   ["/api/playground/chat", { POST: apiPgChat }],
-  ["/api/playground/chat/save", { POST: apiPgChatSave }],
   ["/api/playground/conversations", { GET: apiPgConvList }],
   ["/api/playground/conversations/:id", { GET: apiPgConvGet, PUT: apiPgConvPut, DELETE: apiPgConvDel }],
   ["/api/playground/files", { POST: apiPgFileUp }],

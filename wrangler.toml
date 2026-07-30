@@ -39,13 +39,28 @@ database_id = "75e2b765-66fd-4946-99c4-4524b4149ce0"
 
 # 限流器 Durable Object（v2.0.0 Phase H，ADR-0007）：每個會員一顆實例（idFromName "u:<id>"），
 # SQLite-backed 原子計數，修掉 D1 COUNT 的並發競態。settings 設 quota_do='0' 可免部署退回 D1 路徑。
+#
+# PG_STREAM（v2.5_DO，ADR-0015）：Playground 的串流引擎。**不是拿來存狀態的** ——
+# 它存在的唯一理由是「免費方案的 Worker 每次呼叫只有 10ms CPU，而把上游 SSE 讀進 JS
+# 轉譯一趟要 626ms」。Durable Object 的 CPU 上限是 30 秒（免費方案也一樣，那條 10ms
+# 只綁 Worker），所以昂貴的那段搬進來跑，Worker 只留驗證與建檔＋把回應原樣轉出去。
+# 拿掉這個綁定就退回 v2.4 行為（在 Worker 裡串流）—— 程式不必改一行，見 lib/pgchat.ts。
 [durable_objects]
-bindings = [{ name = "RATE_LIMITER", class_name = "RateLimiter" }]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "RateLimiter" },
+  { name = "PG_STREAM", class_name = "PgStream" }
+]
 
 # DO 類別首次上線要宣告成 SQLite-backed（免費層也只支援這種）；migrations tag 一經部署不可改
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RateLimiter"]
+
+# v2.5_DO：新增 PgStream。**不要改 v1 那一段** —— 已部署的 tag 動了會被 wrangler 擋下來。
+# PgStream 自己不寫 storage，但類別仍要宣告成 sqlite（免費方案不支援 KV-backed DO）。
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PgStream"]
 
 # cron 排程（v2.0.0 Phase I，src/cron.ts）：每 5 分鐘掃 errlog 推 Telegram 告警（secrets
 # TG_BOT_TOKEN／TG_CHAT_ID 未設＝跳過）；每日 UTC 19:17（台北 03:17 低峰）聚合＋備份＋清理。

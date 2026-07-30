@@ -65,28 +65,6 @@ test("會員 pending → 管理員批准 → playground 串流回覆", async ({ 
   await member.locator(".pg-ta").fill("哈囉");
   await member.locator(".pg-send").click();
   await expect(member.getByText("您好，這是 mock 回覆。")).toBeVisible({ timeout: 15_000 });
-
-  // v2.5 直通（ADR-0014）：畫面上看得到**不代表存下來了** —— 直通模式下伺服器看不到內容，
-  // 回覆是由瀏覽器串完之後回報的（POST /api/playground/chat/save）。那條路斷掉的話，
-  // 症狀是「當下聊得很正常，重新整理就整段不見」，而上面那句斷言完全抓不到。
-  await expect
-    .poll(
-      async () => {
-        const list: any = await (await api(member.request, "get", "/api/playground/conversations")).json();
-        const conv = (list.rows || [])[0];
-        if (!conv) return "";
-        const detail: any = await (
-          await api(member.request, "get", "/api/playground/conversations/" + conv.id)
-        ).json();
-        return (detail.messages || [])
-          .filter((m: any) => m.role === "assistant")
-          .map((m: any) => m.content)
-          .join("");
-      },
-      { timeout: 15_000 }
-    )
-    .toContain("mock 回覆");
-
   await memberCtx.close();
   await adminCtx.close();
 });

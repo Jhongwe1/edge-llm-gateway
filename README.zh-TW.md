@@ -4,9 +4,9 @@
 [![線上 demo — 免登入直接試](https://img.shields.io/badge/live%20demo-%E5%85%8D%E7%99%BB%E5%85%A5%E7%9B%B4%E6%8E%A5%E8%A9%A6-2ea44f)](https://uaip.cc.cd/playground)
 &nbsp;線上：**<https://uaip.cc.cd>** · English: **[README.md](./README.md)**
 
-一個 LLM 中轉站，重點在**原子限流、逐請求計量與成本記帳，以及在 10ms CPU 預算下活下來的
-串流** — 全部跑在**一顆 Cloudflare Worker、一顆 D1（SQLite）、一個 Durable Object 類別、
-兩條 cron** 上。零框架、執行期零依賴、沒有容器、執行期不用打包 —— `git push` 就是整條供應鏈。
+一個 LLM 中轉站，重點在**原子限流、逐請求計量與成本記帳，以及一段長到 10ms CPU 裝不下、
+最後搬進 Durable Object 的串流** — 全部跑在**一顆 Cloudflare Worker、一顆 D1（SQLite）、
+兩個 Durable Object 類別、兩條 cron** 上。零框架、執行期零依賴、沒有容器、執行期不用打包 —— `git push` 就是整條供應鏈。
 
 > **現在就能試**：[uaip.cc.cd/playground](https://uaip.cc.cd/playground) — 體驗模式開啟時
 > 不用註冊就能跟真模型聊（fail-closed 限流；對話只留給站長看，訪客這邊沒有歷史紀錄）。
@@ -49,44 +49,49 @@ v1 的作法是「COUNT 一下 req_log，沒超標就放行」—— 兩個併�
 不是可以 catch 的錯誤，沒有 `req_log`、沒有 `errlog` —— 回覆就是講到一半停住，
 而應用層裡沒有任何東西看得到原因，只有 `wrangler tail` 顯示得出來。
 
-前兩輪已經把「逐 chunk 迴圈」壓到極限：寫入端 100ms／1000 字批次門檻，解析端用正則
-直接抽出我們要的那一個字串，而不是為每個 chunk 建出約 17 個物件的樹
-（[ADR-0011](./docs/adr/0011-streaming-cpu-budget.md)）。**還是不夠** —— 長回覆照樣死。
-於是我們量了一件從來沒人量過的事：**如果 JS 根本不碰那些位元組呢？**
-同一個 prompt、同一個模型，CPU 讀自 `wrangler tail`：
+前兩輪optimize已經把「每一筆增量」的迴圈壓到不能再便宜：寫入端 100ms／1000 字的批次門檻，
+解析端用正則直接抽出要的那一個字串，而不是為每個 chunk 建出約 17 個物件的樹
+（[ADR-0011](./docs/adr/0011-streaming-cpu-budget.md)）。**還是不夠。**
+於是我們去量了沒有人量過的那件事 —— 如果 JS 根本不碰那些位元組呢？同一個 prompt、
+同一個模型，CPU 讀自 `wrangler tail`：
 
 | 回應本體怎麼送出去 | chunk 數 | wall | CPU |
 |---|---|---|---|
-| JS 逐筆讀＋解析＋批次寫 | ~3,000 | 20.3 秒 | **626 ms** |
-| `new TransformStream()` ＋ `pipeTo` | 3,683 | 23.9 秒 | **1,001 ms** |
-| `new IdentityTransformStream()` ＋ `pipeTo` | 3,068 | 20.8 秒 | **5 ms** |
+| JS 讀＋解析＋批次寫 | 約 3000 | 20.3 秒 | **626 ms** |
+| `new TransformStream()` ＋ `pipeTo` | 3683 | 23.9 秒 | **1001 ms** |
+| `new IdentityTransformStream()` ＋ `pipeTo` | 3068 | 20.8 秒 | **5 ms** |
 
-所以 v2.5 改成**先在 JS 嗅探前幾個 chunk —— 只要確認這是乾淨的 OpenAI 形狀 SSE、
-沒有任何會寫出上游是誰的欄位 —— 之後整條交給 runtime 轉推**。
-CPU 從此不再跟「模型講多久」成正比：7,895 個 chunk、51 秒，只花 6ms。
-引發這次改動的那個情境（4 張 1.4MB 圖＋長 prompt）從 **615ms 掉到 59ms**；
-剩下的 59ms 不是串流，是**請求側**（把 5.75MB base64 拼進上游 body）——
-那是一次性成本、不會隨回覆變長，歸 `pg_img_total_kb` 管。
+成本在**「JS 有沒有碰到那些位元組」**，不在「寫了幾次」。中間那一列值得單獨一句：
+`new TransformStream()` 是 **JS 實作的**，所以照直覺寫出來的版本會**比不改還糟**，
+而它在 review、在測試、在本機 workerd bench 裡看起來都完全正確
+（本機 bench 比線上低估約 95 倍 —— 沒有 HTTP/2 分框、沒有 TLS、沒有 socket）。
+只有 Cloudflare 的 `IdentityTransformStream` 是原生管線。
 
-中間那一列才是這件事真正的重點。`new TransformStream()` 是 **JS 實作**的 ——
-每個 chunk 都要進 JS 再出來 —— 所以照直覺寫出來的版本會**比什麼都不做更糟**，
-而且在 code review、在測試、在本機 workerd bench 裡都看起來完全正確
-（本機比線上低估約 95 倍：沒有 HTTP/2 分框、沒有 TLS、沒有 socket）。
-只有 Cloudflare 的 `IdentityTransformStream` 是原生管線。**這種事推理不出來，只能量。**
-[ADR-0014](./docs/adr/0014-native-passthrough-streaming.md)
+v2.5 照這個結論做了直通（把上游位元組原樣交給瀏覽器，626ms → 6ms），**v2.6 在一天之內把它推翻**。
+直通換到 CPU 的方法是**把轉譯刪掉**，而轉譯是唯一在每一筆 chunk 裡抹掉上游身分的地方、
+是伺服器讀得到回覆內容與 token 用量的唯一理由、也是關掉網頁後生成還能跑完的唯一理由 ——
+拿這些換幾毫秒不划算（[ADR-0014](./docs/adr/0014-native-passthrough-streaming.md)，
+保留下來當作「量對了、但決定錯了」的紀錄）。
 
-直通不是免費的：Worker 看不到回覆了，所以落地與 token 用量都移到客戶端，
-「關掉網頁後在背景把回覆跑完」在這條路上也沒有了。但 `req_log` 仍然由伺服器在開始直通
-**之前**寫好，所以沒有任何請求能從帳上消失。不符合條件的渠道 —— anthropic、gemini、
-隱藏模型模式，或開頭 chunk 帶了未知頂層欄位（例如 OpenRouter 每筆都寫的 `provider`）
-—— 一律退回轉譯路徑，那些語意一個都沒少。一個設定（`pg_passthrough`）就能整個關掉，不必重新部署。
+**轉譯需要的不是變便宜，是一個跑得下的地方。** Durable Object 每個請求有 **30 秒 CPU，
+免費方案也一樣**（10ms 那條只綁 Worker）。於是整段轉譯搬進去，Worker 只留 I/O 為主的工作，
+外加一個原樣轉出去、JS 碰不到的回應。搬完之後線上實測：
+
+| 呼叫 | CPU | 預算 |
+|---|---|---|
+| Worker `/api/playground/chat` | **3 ms** | 10 ms |
+| Durable Object `PgStream` | **663 ms** | 30,000 ms |
+
+同樣的 626ms 工作量，從「預算的 6260%」變成「預算的 2%」，而且什麼都沒有犧牲：
+淨化、伺服器端落地、token 記帳、背景續跑全都還在。而 30 秒是 **CPU 不是牆鐘** ——
+模型思考 90 秒才吐第一個字完全不花錢，那是等 I/O。
+[ADR-0015](./docs/adr/0015-durable-object-streaming.md)
 
 還有第四個小一點但值得一提的：**客戶端關掉網頁，不該把回覆弄丟。**
 關掉分頁**不會**讓 Workers 取消這條回應串流 —— `writer.write()` 只是永遠不 settle，
 於是請求一路卡到被平台砍掉，順便把 D1 寫入一起帶走。偵測改成「寫入逾時」當死鎖斷路器，
 生成則在預算內繼續跑完，下次打開就看得到完整回覆。
 [ADR-0012](./docs/adr/0012-finish-reply-after-disconnect.md)
-（直通那條路沒有東西可以「繼續」—— 改由瀏覽器用 `sendBeacon` 回報已經收到的部分。）
 
 ## 同一顆 Worker 上還跑了什麼
 
@@ -142,7 +147,8 @@ flowchart LR
 - [ADR-0011 為了續用免費方案 — 串流的 10ms CPU 預算](./docs/adr/0011-streaming-cpu-budget.md)
 - [ADR-0012 斷線後把回覆跑完再存](./docs/adr/0012-finish-reply-after-disconnect.md)
 - [ADR-0013 R2 是可選的 — 附件有兩種儲存模式](./docs/adr/0013-r2-optional-attachments.md)
-- [ADR-0014 串流直通 — 嗅探開頭，其餘交給 runtime 轉推](./docs/adr/0014-native-passthrough-streaming.md)
+- [ADR-0014 串流直通 — 嗅探開頭，其餘交給 runtime 推](./docs/adr/0014-native-passthrough-streaming.md)（已被 0015 取代）
+- [ADR-0015 串流轉譯搬進 Durable Object — 而不是把它刪掉](./docs/adr/0015-durable-object-streaming.md)
 
 另見：[真實數據報告](./docs/REPORT.md) ·
 [安全稽核：兩輪，以及第一輪的漏檢率](./docs/AUDIT-2026-07.md) ·
@@ -150,9 +156,9 @@ flowchart LR
 [與 one-api／LiteLLM／OpenRouter／AI Gateway 的誠實對照](./docs/COMPARISON.md) ·
 [已知債務](./DEBT.md) · [安全政策](./SECURITY.md)
 
-## 工程證據（v2.5.0）
+## 工程證據（v2.6.0）
 
-- **572 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
+- **552 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。
   上游用 fetchMock 攔截，斷言「上游實際收到什麼」（標頭剝除、金鑰置換、串流位元組保真、
   demo 模式強制 max_tokens）。
@@ -226,9 +232,7 @@ npm run seed              # 選用：本機種子（管理員＋會員＋示範�
 npm run dev               # http://localhost:8787
 npm run checks            # eslint＋typecheck＋測試
 npm run e2e               # Playwright（自己起 mock 上游＋wrangler dev）
-npm run bench             # 重現 ADR-0011 的解析側 CPU 數字
-npm run bench:workerd     # 同一段迴圈跑在真 workerd 裡（仍然只是下限 ——
-                          #   真正的 CPU 只有 wrangler tail 看得到，見 ADR-0014）
+npm run bench             # 重現 ADR-0011 的 CPU 數字
 npm run loadtest          # 對限流器 DO 打 200 條真併發
 npm run deploy            # 重建 apidoc＋openapi，然後 wrangler deploy
 npm run migrate:remote    # 正式庫套新 migration（要在 deploy 之前跑）

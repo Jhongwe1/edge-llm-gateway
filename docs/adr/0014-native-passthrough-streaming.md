@@ -1,6 +1,24 @@
 # ADR-0014: Stream passthrough — sniff the head, then let the runtime pump the rest
 
-**Status**: accepted · **Date**: 2026-07-31 · **Supersedes the approach in** [ADR-0011](0011-streaming-cpu-budget.md)
+**Status**: ~~accepted~~ **superseded by [ADR-0015](0015-durable-object-streaming.md)** (2026-07-31, same
+day) · **Date**: 2026-07-31 · **Superseded the approach in** [ADR-0011](0011-streaming-cpu-budget.md)
+
+> **Why this was reversed within a day.** The measurements below are correct and the
+> implementation worked — 626 ms → 6 ms, verified in production. It was withdrawn because of
+> what it *cost*, which this document argued was tolerable and the owner judged was not:
+> passthrough puts raw upstream bytes in front of the member, so `safeHint()`'s sanitation is
+> bypassed by the architecture rather than by choice, and the server can no longer see the
+> reply — which moved persistence and token accounting to the client and deleted background
+> continuation (ADR-0012) outright.
+>
+> ADR-0015 keeps the same goal and pays for it differently: **the transform is not deleted,
+> it is relocated** into a Durable Object, where the CPU budget is 30 s instead of 10 ms.
+>
+> **Everything below stays accurate and is worth reading**, in particular the arm-by-arm CPU
+> table and the three workerd streaming traps (`new TransformStream()` is JS-backed and
+> *slower* than doing nothing; `void write()` + `releaseLock()` silently drops a chunk on a
+> standard TransformStream; `await`-ing that write deadlocks). Those cost real measurement
+> time to find and apply to anyone touching streams on Workers.
 
 ## Context
 

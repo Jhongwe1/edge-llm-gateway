@@ -32,7 +32,13 @@ export default defineWorkersConfig(async () => {
             // D1 模式就再也測不到了。要測 R2 的測試自己組 { ...env, FILES: env.FILES_TEST }。
             r2Buckets: ["BACKUPS", "FILES_TEST"],
             durableObjects: {
-              RATE_LIMITER: { className: "RateLimiter", useSQLite: true }
+              RATE_LIMITER: { className: "RateLimiter", useSQLite: true },
+              // PG_STREAM_TEST 跟 FILES_TEST 同一個道理，**故意不叫 PG_STREAM**：
+              // chat handler 看 env.PG_STREAM 在不在來決定要不要交棒給 DO（ADR-0015），
+              // 真的綁成 PG_STREAM 的話全部既有測試都會改走 DO 路徑，
+              // 「沒有 DO 的退路」就再也測不到了 —— 而那是站台的保命索。
+              // 要測 DO 路徑的測試自己組 { ...env, PG_STREAM: env.PG_STREAM_TEST }。
+              PG_STREAM_TEST: { className: "PgStream", useSQLite: true }
             },
             bindings: {
               TEST_MIGRATIONS: migrations,

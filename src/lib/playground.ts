@@ -347,9 +347,11 @@ export async function imgBytesBudget(env: Env): Promise<number> {
   return PG_LIMITS.maxImgBytesTotal;
 }
 
+// userId 而不是整列 UserRow：這支只用得到 id，而 v2.5_DO 的呼叫端在 Durable Object 裡
+// （ADR-0015），那邊拿到的是交棒過來的 job，本來就沒有完整的 users 列。
 export async function loadImages(
   env: Env,
-  user: UserRow,
+  userId: number,
   messages: ChatMsg[],
   seesImages: boolean,
   maxImgs?: number,
@@ -372,7 +374,7 @@ export async function loadImages(
     const rs = await env.DB.prepare(
       "SELECT * FROM pg_files WHERE id IN (" + uniq.join(",") + ") AND user_id=?1"
     )
-      .bind(user.id)
+      .bind(userId)
       .all();
     for (const r of (rs.results || []) as FileRow[]) byId.set(Number(r.id), r);
   } catch (e) {

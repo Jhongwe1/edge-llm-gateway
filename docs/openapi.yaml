@@ -256,15 +256,7 @@ paths:
       tags: [Playground]
       summary: 聊天（SSE 串流；demo 模式匿名可用、fail-closed 限流）
       description: |
-        **兩種回應格式，看回應標頭 `x-pg-mode`**（v2.5，ADR-0014）：
-        沒有這個標頭＝下面描述的「轉譯」形狀；`passthrough`＝**上游原始 chunk 直通**
-        （第一筆仍是 `{conv,title?,mode,log}`，之後是上游原文與 `data: [DONE]`），
-        此時回覆要由客戶端呼叫 `POST /api/playground/chat/save` 落地。
-        直通條件：kind 是 openai/custom、上游真的回 SSE、非 dumb/demo、`pg_passthrough` 沒關、
-        且開頭 chunk 通過欄位白名單嗅探（出現 `provider` 之類的未知頂層欄位就退回轉譯）。
-        管理員可用 `?stream=transform|passthrough` 強制單一路徑。
-
-        SSE 事件流（轉譯）：`{conv,title?}`（demo 多帶一個 `demo:true`，意思是「前端別動對話列表」）→ 多筆 `{r:"思考增量"}`／`{d:"增量"}` → `{done:true}`；
+        SSE 事件流：`{conv,title?}`（demo 多帶一個 `demo:true`，意思是「前端別動對話列表」）→ 多筆 `{r:"思考增量"}`／`{d:"增量"}` → `{done:true}`；
         中途錯誤 `{error,hint}`。上游一開始就失敗直接回 JSON 錯誤。
         `r` 是推理模型的思考過程（reasoning_content / reasoning / thinking_delta / gemini thought part），
         不寫進資料庫、非推理模型不會出現。整趟沒有任何 `d` → `{error:"empty-output",hint}`，不會靜默結束。
@@ -286,41 +278,6 @@ paths:
             description: 配額或限流,
             content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
           }
-  /api/playground/chat/save:
-    post:
-      tags: [Playground]
-      summary: 直通模式的回覆落地（由前端回報內容與 token 用量）
-      description: |
-        v2.5 起 openai/custom 渠道預設走「直通」——上游 SSE 原封不動轉推給客戶端，
-        Worker 看不到內容（線上 CPU 626ms → 6ms，見 ADR-0014）。所以回覆由客戶端串完之後
-        回報進資料庫；轉譯路徑（anthropic/gemini/dumb/demo/嗅探沒過）不需要呼叫這支。
-        冪等：同一則對話最後一列已是 assistant 就改寫那一列，且**只有變長才覆寫**
-        （關網頁時 sendBeacon 送的半截內容不會蓋掉完整回覆）。
-        log_id 用來把 token 用量補回 req_log，只補得了一次、而且只動自己的列。
-      security: [{ sessionCookie: [] }, { adminToken: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [conv_id]
-              properties:
-                conv_id: { type: integer, description: 對話編號（chat 回應的 x-pg-conv） }
-                log_id: { type: integer, description: 這趟的 req_log 列編號（x-pg-log） }
-                content: { type: string, description: assistant 回覆全文（空＝只更新計量） }
-                tokens_in: { type: integer }
-                tokens_out: { type: integer }
-                dur_ms: { type: integer }
-                status:
-                  type: string
-                  enum: [ok, empty-output, upstream-error, aborted]
-                  description: 收尾狀態（固定清單，不收自由字串）
-      responses:
-        "200": { description: '{ ok, saved: "insert"|"update"|"skip" }' }
-        "400": { description: 缺 conv_id }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { description: 不存在或不是自己的對話 }
   /api/playground/conversations:
     get:
       tags: [Playground]
