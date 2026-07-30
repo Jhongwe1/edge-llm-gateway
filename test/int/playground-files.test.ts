@@ -472,6 +472,76 @@ describe("聊天串接", () => {
     expect(sent.split("data:image/webp;base64,").length - 1).toBe(1);
   });
 
+  // ── 圖片總量預算（2026-07-29 放寬到 16MB，可用 pg_img_total_kb 調）──
+  it("req_log 記下 img_bytes 與 build_ms（放寬期間就靠這份數據回頭定上限）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({ models: "m1", vision_models: "m1", base_url: UP });
+    const ids = await upload3(u);
+    interceptOnce(() => {});
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "看圖", files: ids }]
+    });
+    await readAll(await chat(ctx));
+    await drainWaits(ctx);
+
+    const row = await env.DB.prepare(
+      "SELECT img_bytes, build_ms FROM req_log WHERE user_id=?1 ORDER BY id DESC LIMIT 1"
+    )
+      .bind(u.id)
+      .first<any>();
+    expect(row.img_bytes).toBe(900); // 3 張 × 300 bytes
+    expect(row.build_ms).not.toBeNull();
+  });
+
+  it("沒帶圖的請求 img_bytes 留 NULL（查分佈時直接濾掉純文字）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({ models: "m1", base_url: UP });
+    interceptOnce(() => {});
+    const ctx = await chatCtx(u, {
+      channel: ch.slug,
+      model: "m1",
+      messages: [{ role: "user", content: "純文字" }]
+    });
+    await readAll(await chat(ctx));
+    await drainWaits(ctx);
+    const row = await env.DB.prepare(
+      "SELECT img_bytes, build_ms FROM req_log WHERE user_id=?1 ORDER BY id DESC LIMIT 1"
+    )
+      .bind(u.id)
+      .first<any>();
+    expect(row.img_bytes).toBeNull();
+    expect(row.build_ms).toBeNull();
+  });
+
+  it("pg_img_total_kb 調小 → 立刻生效且回錯誤（不必重新部署）", async () => {
+    const u = await approved();
+    const ch = await seedChannel({ models: "m1", vision_models: "m1", base_url: UP });
+    // 每張 600 bytes ×3 = 1800 > 1KB 預算 → 第 2 張就超（第 1 張 600 塞得下）
+    const ids: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const up = await upCtx(u, fakeWebp(600));
+      ids.push(((await (await uploadFile(up)).json()) as any).id);
+      await drainWaits(up);
+    }
+    // 預算調到 1KB —— 設定值最小單位是 KB，所以圖要夠大才測得出邊界
+    await env.DB.prepare("INSERT OR REPLACE INTO settings (k,v) VALUES ('pg_img_total_kb','1')").run();
+    try {
+      const ctx = await chatCtx(u, {
+        channel: ch.slug,
+        model: "m1",
+        messages: [{ role: "user", content: "看圖", files: ids }]
+      });
+      const r = await chat(ctx);
+      await drainWaits(ctx);
+      expect(r.status).toBe(400);
+      expect(((await r.json()) as any).hint).toContain("加起來太大");
+    } finally {
+      await env.DB.prepare("DELETE FROM settings WHERE k='pg_img_total_kb'").run();
+    }
+  });
+
   it("跟張數無關的 400 不會亂學（只有講到 image 上限的才學）", async () => {
     const u = await approved();
     const ch = await seedChannel({

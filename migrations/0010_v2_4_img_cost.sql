@@ -1,0 +1,21 @@
+-- Migration 0010 — v2.4.2：記錄「這一趟送了多少圖片、組 body 花了多久」。
+--
+-- 目的（2026-07-29 站長決定把圖片總量上限從 1.5MB 放寬到 16MB 時一起加的）：
+-- 放寬之後要有辦法回頭判斷該定在哪，而**光靠錯誤碼是收不到這份數據的** ——
+-- 免費方案 10ms CPU 燒穿時 isolate 直接被殺（ADR-0011），串流無聲中斷，
+-- req_log 與 errlog 都來不及寫，站內完全沒有痕跡，只有 wrangler tail 看得到。
+--
+-- 所以改成正面記錄成功案例的成本分佈：
+--   img_bytes ── 這一趟所有圖片的原始 bytes 總和
+--   build_ms  ── buildUpstream（組上游請求本體）花掉的毫秒
+-- 兩欄都可以是 NULL：沒帶圖的請求不填，舊資料也維持 NULL。
+--
+-- 怎麼用這份數據：
+--   1. 成功案例：SELECT img_bytes, build_ms FROM req_log WHERE img_bytes IS NOT NULL
+--      → 看 build_ms 隨 img_bytes 成長的實際斜率（線上 workerd，不是本機估的）
+--   2. 失敗案例（CPU 被殺）雖然沒有 req_log，但**可以反推**：
+--      pg_messages 有 user 那一列、卻沒有對應的 assistant 列，且該 conv 沒有 req_log
+--      → 那就是死掉的那些；再用 pg_files 把那則訊息的圖片 bytes 加總，
+--        就知道死亡發生在多大的量級。
+ALTER TABLE req_log ADD COLUMN img_bytes INTEGER;
+ALTER TABLE req_log ADD COLUMN build_ms INTEGER;

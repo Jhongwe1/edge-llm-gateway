@@ -32,7 +32,7 @@ import { json, siteBrand } from "../../../lib/site.js";
 import { adminOk, pgOpenAll } from "../../../lib/auth.js";
 import { QUOTA_DEFAULTS } from "../../../lib/quota.js";
 import { DEMO_DEFAULTS, demoCfg } from "../../../lib/demo.js";
-import { PG_DEFAULT_SYSTEM } from "../../../lib/playground.js";
+import { PG_DEFAULT_SYSTEM, PG_LIMITS } from "../../../lib/playground.js";
 import { FILE_DEFAULTS, FILE_CEILING, activeStore, fileLimits } from "../../../lib/filestore.js";
 import { R2_FREE, R2_PLAN, r2Ops, r2MbFromRawMb } from "../../../lib/r2budget.js";
 import { audit } from "../../../lib/observe.js";
@@ -47,6 +47,11 @@ const DEMO_NUM_KEYS = ["demo_per_min", "demo_per_ip_day", "demo_global_day", "de
 // 天花板寫死在 FILE_CEILING，這裡只負責把超過的請求擋下來並說清楚為什麼 ——
 // 「配額可設定」不能等於「免費額度可突破」，手滑多打一個 0 就開始收費是不能接受的。
 const FILE_KEYS = ["pgfile_max_kb", "pgfile_user_mb", "pgfile_total_mb"];
+// 單次請求「所有圖片」的 bytes 總和上限（KB）。2026-07-29 站長把預設放寬到 16MB，
+// 並要求「先讓大家測、幾天後看數據再定」—— 做成設定就是為了那一步：
+// 調整不必改程式、不必重新部署，/settings 改完立刻生效。
+// 天花板是 PG_LIMITS.maxImgBytesCeiling（只能往下調）。
+const PG_IMG_KEY = "pg_img_total_kb";
 const ALL_KEYS = [
   "brand",
   "contact_url",
@@ -72,7 +77,8 @@ const ALL_KEYS = [
 ]
   .concat(QUOTA_KEYS)
   .concat(DEMO_NUM_KEYS)
-  .concat(FILE_KEYS);
+  .concat(FILE_KEYS)
+  .concat([PG_IMG_KEY]);
 
 // Telegram bot token 的遮罩提示（同 relay 管道 key_hint 精神：只給尾 4 碼）
 function tgHint(v: string | undefined): string {
@@ -296,7 +302,7 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
     }
     const store = activeStore(env);
     const ceiling = FILE_CEILING[store] as Record<string, number>;
-    for (const k of QUOTA_KEYS.concat(FILE_KEYS)) {
+    for (const k of QUOTA_KEYS.concat(FILE_KEYS).concat([PG_IMG_KEY])) {
       if (!(k in body)) continue;
       const v = body[k];
       if (v === null || v === "") {
@@ -307,11 +313,30 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
       if (!Number.isFinite(n) || n < 1) {
         const def =
           (QUOTA_DEFAULTS as Record<string, number>)[k] ??
-          (FILE_DEFAULTS[store] as Record<string, number>)[k];
+          (FILE_DEFAULTS[store] as Record<string, number>)[k] ??
+          (k === PG_IMG_KEY ? Math.round(PG_LIMITS.maxImgBytesTotal / 1024) : undefined);
         return json(
           { error: "bad-input", hint: k + " 要是正整數，或 null＝回到內建預設（" + def + "）" },
           400
         );
+      }
+      // 圖片總量的天花板跟附件三層分開算（它限的是 CPU，不是儲存額度）
+      if (k === PG_IMG_KEY) {
+        const capKb = Math.round(PG_LIMITS.maxImgBytesCeiling / 1024);
+        if (n > capKb) {
+          return json(
+            {
+              error: "bad-input",
+              hint:
+                PG_IMG_KEY +
+                " 最多只能設到 " +
+                capKb +
+                " KB —— 這條限的是免費方案每請求 10ms CPU（組上游 body 的成本跟圖片總 bytes 成正比），不是儲存空間",
+              ceiling: capKb
+            },
+            400
+          );
+        }
       }
       // 附件三層有硬天花板（見 FILE_CEILING）。超過就擋，並且明講擋在哪、為什麼 ——
       // 這是「確保不會超出免費額度」真正生效的地方，靜靜夾成上限反而會讓人以為設定成功了。

@@ -25,15 +25,25 @@ export const PG_LIMITS = {
   // 10 張各 150KB 與 3 張各 500KB 對 CPU 完全一樣。10 只是「一次對話裡塞得下的
   // 合理張數」，真正會先撞到的天花板永遠是 bytes 那條。
   maxImgPerMsg: 10,
-  // 單次請求「所有圖片」的原始 bytes 總和上限。這個數字是量出來的，不是拍的：
-  // 組上游 body 的成本（含 fetch 必付的 bytes 轉換，實測 2026-07-29）
+  // 單次請求「所有圖片」的原始 bytes 總和的**預設**上限。
+  //
+  // ── 2026-07-29 站長決定放寬到 16MB，先蒐集真實數據再回頭定 ──
+  // 原本是 1.5MB，來自這組實測（組上游 body，含 fetch 必付的 bytes 轉換）：
   //   933KB base64 → 1.62ms ｜ 1.8MB → 3.31ms ｜ 2.8MB → 6.00ms
-  // 免費方案每請求 10ms CPU，而這筆花費發生在**串流開始之前** —— 花掉的每一毫秒
-  // 都是從後面串流迴圈的預算裡扣的。1.5MB 原始（≈2MB base64）約 2.4ms，
-  // 留 7.5ms 給串流、D1 與其他工作，這是安全的分配。
-  // 超出的部分不是報錯，而是把**最舊**的圖降級成文字佔位（見 chat.ts pickImages）——
-  // 使用者不會因為對話變長就突然被擋住，只是模型看不到很久以前那幾張圖。
-  maxImgBytesTotal: 1500000
+  // 免費方案每請求 10ms CPU，而這筆花費發生在**串流開始之前**，所以當初取 1.5MB
+  // 原始（≈2MB base64、約 2.4ms），留 7.5ms 給串流與 D1。
+  //
+  // 站長的判斷是「先放寬讓大家測，有數據再定」，並指出 10ms 的主要殺手是**回應側
+  // 太碎**（逐筆轉推）而不是請求側 —— 這點對，那正是 ADR-0011 修掉的那座山。
+  // 但請求側並非與大小無關：上面那組數字就是照 bytes 線性長的，只是沒有回應側致命。
+  // 兩者的差別在於「一次性成本」vs「跟回覆長度成正比的成本」。
+  //
+  // 放寬期間靠 migration 0010 的 req_log.img_bytes／build_ms 蒐集真實分佈；
+  // 幾天後用那份數據決定最終值。**要調不必改程式**：/settings 的 pg_img_total_kb
+  // 可以隨時上下調（上限 maxImgBytesCeiling），改完立刻生效。
+  maxImgBytesTotal: 16000000,
+  // 設定值的天花板 —— 管理員能往下調、不能突破這條。
+  maxImgBytesCeiling: 32000000
 };
 
 // 管道沒填系統提示詞時，playground 實際送出的預設值。
@@ -321,13 +331,30 @@ function takeImgs(m: ChatMsg, acc: ImgAcc): { im: ChatImage; ph: string }[] {
  * 被降級的圖不會憑空消失 —— 內容裡會補一行「[已省略的圖片：檔名]」，模型知道這裡本來
  * 有圖，使用者從對話也看得出來。
  */
+/**
+ * 圖片總量預算（bytes）。管理員可在 /settings 用 pg_img_total_kb 調整，
+ * 上限是程式寫死的 maxImgBytesCeiling —— 只能往下調，不能突破。
+ * 讀不到設定（沒設／D1 出問題）一律退回內建預設，絕不因此讓聊天壞掉。
+ */
+export async function imgBytesBudget(env: Env): Promise<number> {
+  try {
+    const r = await env.DB.prepare("SELECT v FROM settings WHERE k='pg_img_total_kb'").first<{
+      v: string;
+    }>();
+    const kb = parseInt(String((r && r.v) || ""), 10);
+    if (kb > 0) return Math.min(kb * 1024, PG_LIMITS.maxImgBytesCeiling);
+  } catch (e) {}
+  return PG_LIMITS.maxImgBytesTotal;
+}
+
 export async function loadImages(
   env: Env,
   user: UserRow,
   messages: ChatMsg[],
   seesImages: boolean,
-  maxImgs?: number
-): Promise<{ err?: string }> {
+  maxImgs?: number,
+  maxBytes?: number
+): Promise<{ err?: string; imgBytes?: number }> {
   const ids: number[] = [];
   for (const m of messages) if (m.fileIds) for (const id of m.fileIds) ids.push(id);
   if (!ids.length) return {};
@@ -354,7 +381,8 @@ export async function loadImages(
 
   // 第一輪：從最新往回走，決定哪些留、哪些降級（先不讀內容 —— R2 讀取要平行化）
   const want: { m: ChatMsg; rows: FileRow[] }[] = [];
-  let budget = PG_LIMITS.maxImgBytesTotal;
+  const cap = maxBytes == null ? PG_LIMITS.maxImgBytesTotal : maxBytes;
+  let budget = cap;
   // 張數預算：整趟請求總共還能送幾張（不是每則訊息各自算）。上游的限制講的是
   // 「one prompt」，而一次請求＝一個 prompt，所以要跨訊息一起數。
   // 沒帶＝沿用站上的單則上限，行為跟 v2.4.1 之前一樣。
@@ -403,9 +431,7 @@ export async function loadImages(
       if (overBytes) {
         return {
           err:
-            "這幾張圖加起來太大（上限約 " +
-            Math.round(PG_LIMITS.maxImgBytesTotal / 100000) / 10 +
-            "MB）— 請減少張數或換小一點的圖"
+            "這幾張圖加起來太大（上限約 " + Math.round(cap / 100000) / 10 + "MB）— 請減少張數或換小一點的圖"
         };
       }
     }
@@ -415,6 +441,9 @@ export async function loadImages(
     }
   }
   if (!want.length) return {};
+  // 這一趟真正會送出去的圖片總 bytes（降級掉的不算）。回給呼叫端寫進 req_log.img_bytes，
+  // 放寬上限期間就是靠這欄累積「多大的量會出事」的真實分佈（migration 0010）。
+  const imgBytes = cap - budget;
 
   // 第二輪：平行讀內容。D1 路徑是直接讀欄位（零 I/O），R2 路徑則是每張一次物件讀取 ——
   // 序列跑的話延遲會疊加，平行就只花最慢那一張的時間。
@@ -447,7 +476,7 @@ export async function loadImages(
       return acc.concat(w.rows);
     }, [])
   );
-  return {};
+  return { imgBytes: imgBytes };
 }
 
 // 把統一格式的 messages 轉成各家上游的串流請求 → { url, headers, body }

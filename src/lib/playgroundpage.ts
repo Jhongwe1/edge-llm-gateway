@@ -8,7 +8,7 @@
 import { html, pageShell, assetSrc } from "./site.js";
 import { getChromeFor } from "./chrome.js";
 import { MEMBER_CSS, MEMBER_JS } from "./memberui.js";
-import { PG_LIMITS } from "./playground.js";
+import { imgBytesBudget } from "./playground.js";
 import { uploadPlan } from "./filestore.js";
 import type { Env } from "../types.js";
 
@@ -189,19 +189,20 @@ export async function playgroundPageResponse(env: Env, request: Request): Promis
 
   // 前端壓縮圖片時要壓到多小 —— 兩條線取小的那條：
   //   1. 伺服器這次收得下多大（純 D1 1400KB／R2 5MB；R2 寫入額度用完會自動退回 D1 那條）
-  //   2. 單次對話能送給上游多少圖（PG_LIMITS.maxImgBytesTotal，1.5MB）
+  //   2. 單次對話能送給上游多少圖（imgBytesBudget，可在 /settings 調 pg_img_total_kb）
   // 第 2 條是**CPU** 換算出來的，換到 R2 也不會變。少了它的話會出現最難解釋的那種壞法：
   // 圖傳得上去、縮圖也看得到，但模型永遠說「我沒看到圖」—— 因為它在組上游 body 之前
   // 就被降級成文字佔位了（見 loadImages）。壓縮目標壓在模型吃得下的線內，才不會發生。
   const plan = await uploadPlan(env);
-  const compressTo = Math.min(plan.maxKb * 1024, PG_LIMITS.maxImgBytesTotal);
+  const imgTotal = await imgBytesBudget(env);
+  const compressTo = Math.min(plan.maxKb * 1024, imgTotal);
 
   const body =
-    // total＝整趟請求所有圖片的 bytes 上限（PG_LIMITS.maxImgBytesTotal）。前端要知道它，
-    // 才有辦法在「加圖」與「送出」當下就講清楚 —— 以前這個預算只有伺服器知道，
-    // 超過的圖被默默降級成文字佔位，會員完全不知道自己少送了東西（2026-07-29 修）。
+    // total＝整趟請求所有圖片的 bytes 上限。前端要知道它，才有辦法在「加圖」與「送出」
+    // 當下就講清楚 —— 以前這個預算只有伺服器知道，超過的圖被默默降級成文字佔位，
+    // 會員完全不知道自己少送了東西（2026-07-29 修）。
     "<script data-nonce>window.__PGFILE=" +
-    JSON.stringify({ max: compressTo, store: plan.store, total: PG_LIMITS.maxImgBytesTotal }) +
+    JSON.stringify({ max: compressTo, store: plan.store, total: imgTotal }) +
     ";</script>\n" +
     '<div id="root"><div class="gate"><div class="spin"></div></div></div>\n' +
     '<script data-nonce src="' +

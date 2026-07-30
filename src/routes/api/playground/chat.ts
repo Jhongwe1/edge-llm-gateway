@@ -27,7 +27,8 @@ import {
   extractUsage,
   chModels,
   dumbCfg,
-  loadImages
+  loadImages,
+  imgBytesBudget
 } from "../../../lib/playground.js";
 import { maxImagesFor, seesImagesFor, imgLimitFromError, learnImgLimit } from "../../../lib/modelcaps.js";
 import { fastDelta } from "../../../lib/fastsse.js";
@@ -237,14 +238,28 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   // 張數上限來自「上游自己回報的模型能力」快取（migration 0009，見 lib/modelcaps.ts）——
   // 有些模型單次只吃 1 張，照站上寫死的 4 張送過去就是一發 400（2026-07-30 事故）。
   // 這裡讀的是 ch 那一列上的欄位，沒有額外查詢、也不會即時去問上游。
-  const imgLoad = await loadImages(env, user, v.messages, sees, maxImagesFor(ch, v.model));
+  const imgLoad = await loadImages(
+    env,
+    user,
+    v.messages,
+    sees,
+    maxImagesFor(ch, v.model),
+    await imgBytesBudget(env)
+  );
   if (imgLoad.err) return json({ error: "no-vision", hint: imgLoad.err, conv: convId }, 400);
 
   // 打上游（demo 有填 demo_max_tokens 才壓回覆長度；留空＝0＝跟會員路徑一樣不設限）
   // 站台預設系統提示詞只在「這個管道自己沒填」時才需要查 — 有填的話那一查是純浪費，
   // 免費方案的 10ms CPU 與子請求都省一點是一點。
   const defSys = String(ch.system_prompt || "").trim() ? "" : await pgDefaultSystem(env);
+  // 量 buildUpstream 花掉多久（migration 0010 的 build_ms）。放寬圖片總量上限之後，
+  // 這是唯一能回答「多大的量會把 10ms CPU 吃掉」的線上數據 —— 真的爆掉時 isolate
+  // 被直接殺掉、什麼都寫不進去（ADR-0011），所以只能從**成功案例**的分佈往上推。
+  // 註：Workers 的 Date.now() 只在 I/O 後前進，而 buildUpstream 全程無 I/O，
+  //     所以這個差值量到的就是純 CPU 時間，不含等待。
+  const tBuild = Date.now();
   const up = buildUpstream(ch, v.model, v.messages, (demo && demo.maxTokens) || undefined, defSys);
+  const buildMs = Date.now() - tBuild;
   const t0 = Date.now();
   let resp: Response;
   try {
@@ -587,8 +602,8 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
         // 計量：req_log 併進同一個 batch（配額計數與延遲/成本研究數據共用）
         stmts.push(
           env.DB.prepare(
-            "INSERT INTO req_log (ts,user_id,svc,channel,model,status,dur_ms,ttfb_ms,tokens_in,tokens_out) " +
-              "VALUES (?1,?2,'pg',?3,?4,?5,?6,?7,?8,?9)"
+            "INSERT INTO req_log (ts,user_id,svc,channel,model,status,dur_ms,ttfb_ms,tokens_in,tokens_out,img_bytes,build_ms) " +
+              "VALUES (?1,?2,'pg',?3,?4,?5,?6,?7,?8,?9,?10,?11)"
           ).bind(
             t2,
             user.id,
@@ -598,7 +613,11 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
             Date.now() - t0,
             ttfb,
             usage.tokens_in,
-            usage.tokens_out
+            usage.tokens_out,
+            // 沒帶圖的請求兩欄都留 NULL —— 之後查分佈時 WHERE img_bytes IS NOT NULL
+            // 就直接把純文字那些濾掉了
+            imgLoad.imgBytes == null ? null : imgLoad.imgBytes,
+            imgLoad.imgBytes == null ? null : buildMs
           )
         );
         await env.DB.batch(stmts);
