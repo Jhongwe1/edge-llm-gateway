@@ -7,7 +7,7 @@
 
 import type { Env } from "../types.js";
 
-export const VERSION = "2.4.1"; // 站台版本（/api/health 回報；發佈時同步 git tag）
+export const VERSION = "2.5.0"; // 站台版本（/api/health 回報；發佈時同步 git tag）
 
 // 靜態資產的快取破壞參數（2026-07-22 收斂成單一常數）。
 // public/assets/*.js 有 4 小時的邊緣／瀏覽器快取，改了就要把這個值調大，否則回訪的

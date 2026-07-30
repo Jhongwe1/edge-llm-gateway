@@ -32,6 +32,16 @@ import {
 } from "../../../lib/playground.js";
 import { maxImagesFor, seesImagesFor, imgLimitFromError, learnImgLimit } from "../../../lib/modelcaps.js";
 import { fastDelta } from "../../../lib/fastsse.js";
+import {
+  SNIFF_READS,
+  buildPassthrough,
+  passthroughBlocked,
+  passthroughHeaders,
+  passthroughOn,
+  sniffPassthrough,
+  startReqLog
+} from "../../../lib/pgstream.js";
+import type { SniffVerdict } from "../../../lib/pgstream.js";
 import { checkQuota } from "../../../lib/quota.js";
 import { demoCfg, demoUser, demoCheck, demoLockedModel, DEMO_DEFAULTS } from "../../../lib/demo.js";
 import { reportError, reportErrorNow } from "../../../lib/observe.js";
@@ -114,15 +124,20 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
   //   會員（非管理員）→ 鎖到管理員指定的 dumb_channel×dumb_model。
   //   demo（匿名）→ 2026-07-22 起也一起鎖，但鎖的是**體驗模式自己的**渠道與模型：
   //     dumb 只負責「不讓人挑」，跑哪個仍歸 demo_channel 管（見 demoLockedModel 的理由）。
+  // dumbOn＝「這個人的模型是被藏起來的」。v2.5 的直通會把上游原始 chunk（裡面寫著
+  // "model":"真名"）原樣送到瀏覽器，所以這個旗標要一路帶到下面當直通的閘門。
+  let dumbOn = false;
   if (body && typeof body === "object") {
     if (demo) {
       if ((await dumbCfg(env)).on) {
+        dumbOn = true;
         body.channel = demo.channel;
         body.model = await demoLockedModel(env, demo);
       }
     } else if (!isAdm) {
       const dcfg = await dumbCfg(env);
       if (dcfg.on) {
+        dumbOn = true;
         body.channel = dcfg.channel;
         body.model = dcfg.model;
       }
@@ -328,6 +343,94 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
     );
   }
 
+  const ct = String(resp.headers.get("content-type") || "");
+  const ttfb = Date.now() - t0; // 上游回應標頭到手的時間
+
+  // ══ v2.5 直通（2026-07-31，ADR-0014）══════════════════════════════════════
+  // 先在 JS 讀最多 SNIFF_READS 個 chunk 確認形狀乾淨，之後整條交給原生管線轉推 ——
+  // 從這一刻起 JS 一個位元組都不再碰，CPU 不再跟串流長度成正比。
+  // 線上實測（同一個 prompt）：轉譯 626ms → 直通 6ms，見 lib/pgstream.ts 檔頭。
+  //
+  // 任何一步不確定就退回下面的轉譯路徑：那條路 CPU 貴，但語意完整（錯誤淨化、
+  // usage、斷線續跑），所以「不確定就走貴的那條」永遠是安全的方向。
+  //
+  // 管理員可用 ?stream=transform／passthrough 強制單一路徑（A/B 與除錯用；會員無效）。
+  const force = isAdm ? String(url.searchParams.get("stream") || "").toLowerCase() : "";
+  const ptBlock =
+    force === "transform"
+      ? "管理員指定 ?stream=transform"
+      : passthroughBlocked({
+          ch: ch,
+          contentType: ct,
+          enabled: force === "passthrough" || (await passthroughOn(env)),
+          dumb: dumbOn,
+          demo: !!demo
+        });
+
+  // 嗅探讀到一半就決定退回轉譯時，這三個要交棒給下面的迴圈 —— 已經讀掉的位元組不能丟，
+  // 而且解碼器必須是**同一顆**（多位元組字元可能剛好被 chunk 邊界切成兩半）。
+  let preReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let preBuf = "";
+  const dec0 = new TextDecoder();
+
+  if (!ptBlock && resp.body) {
+    const rd = resp.body.getReader();
+    const replay: Uint8Array[] = [];
+    let sniff: SniffVerdict = { verdict: "more", why: "" };
+    let ended = false;
+    for (let i = 0; i < SNIFF_READS; i++) {
+      const step = await rd.read();
+      if (step.done) {
+        ended = true;
+        break;
+      }
+      replay.push(step.value);
+      preBuf += dec0.decode(step.value, { stream: true });
+      sniff = sniffPassthrough(preBuf);
+      if (sniff.verdict !== "more") break;
+    }
+    if (!ended && sniff.verdict === "ok") {
+      rd.releaseLock(); // 放鎖之後 body 才能交給 pipeTo
+      // req_log 先寫、而且要**等它回來**：直通之後伺服器再也看不到這趟的任何東西，
+      // 這一列是「這個請求存在過」的唯一憑據（配額的 D1 降級路徑也靠它數）。
+      // rowid 交給前端，串完再回頭補 token 用量與總耗時（見 chat/save.ts）。
+      const logId = await startReqLog(env, {
+        user_id: user.id,
+        channel: v.channel,
+        model: v.model,
+        status: resp.status,
+        ttfb_ms: ttfb,
+        img_bytes: imgLoad.imgBytes == null ? null : imgLoad.imgBytes
+      });
+      const head: Record<string, unknown> = { conv: convId, mode: "passthrough" };
+      if (newTitle) head.title = newTitle;
+      if (logId != null) head.log = logId;
+      return buildPassthrough(
+        resp.body,
+        new TextEncoder().encode("data: " + JSON.stringify(head) + "\n\n"),
+        replay,
+        passthroughHeaders(convId!, logId),
+        function (p) {
+          context.waitUntil(p);
+        }
+      );
+    }
+    // 退回轉譯：把 reader 與已解碼的殘料交棒下去（reject 的理由只留給管理員看）
+    preReader = ended ? null : rd;
+    if (ended) rd.releaseLock();
+    if (sniff.verdict === "reject") {
+      reportError(
+        env,
+        function (p) {
+          context.waitUntil(p);
+        },
+        "pg.passthrough",
+        "直通被擋下，退回轉譯路徑",
+        { user_id: user.id, path: "/playground/" + v.channel, detail: sniff.why }
+      );
+    }
+  }
+
   // 統一 SSE 輸出；上游讀取與 D1 寫入掛在 waitUntil，回應先開始流
   const ts = new TransformStream();
   const writer = ts.writable.getWriter();
@@ -403,8 +506,6 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
         } catch (e) {}
       });
   }
-  const ct = String(resp.headers.get("content-type") || "");
-  const ttfb = Date.now() - t0; // 上游回應標頭到手的時間
   const usage: UsageAcc = { tokens_in: null, tokens_out: null }; // 上游回報的 token 用量（掃不到＝NULL）
 
   context.waitUntil(
@@ -496,16 +597,26 @@ export async function onRequestPost(context: RouteCtx): Promise<Response> {
           if (full) await send({ d: full });
           else errMsg = "上游沒有回覆內容";
         } else {
-          const reader = resp.body!.getReader();
-          const dec = new TextDecoder();
-          let buf = "";
+          // v2.5：嗅探可能已經先讀掉幾個 chunk（見上面的直通判斷）。那時 reader 與
+          // 解碼器都要沿用**同一顆** —— 換一顆新的會讓被 chunk 邊界切開的多位元組字元
+          // 解碼成問號，而且已經讀掉的位元組再也拿不回來。
+          const reader = preReader || resp.body!.getReader();
+          const dec = dec0;
+          let buf = preBuf;
+          // 第一圈直接處理嗅探留下來的殘料，不先 read（不然殘料要等下一個 chunk 才被看到，
+          // 上游若剛好在這裡結束就整段掉了）
+          let pending = buf.length > 0;
           // anthropic／gemini 的增量形狀跟 OpenAI 完全不同，套不上快速路徑的正則 —
           // 這兩種一律走完整解析（gemini 的 chunk 數量本來就比 OpenAI 少一個量級）
           const slowKind = ch.kind === "anthropic" || ch.kind === "gemini";
           readLoop: while (true) {
-            const step = await reader.read();
-            if (step.done) break;
-            buf += dec.decode(step.value, { stream: true });
+            if (pending) {
+              pending = false;
+            } else {
+              const step = await reader.read();
+              if (step.done) break;
+              buf += dec.decode(step.value, { stream: true });
+            }
             let idx;
             while ((idx = buf.indexOf("\n")) >= 0) {
               const line = buf.slice(0, idx).replace(/\r$/, "");

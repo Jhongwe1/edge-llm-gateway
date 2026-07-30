@@ -73,6 +73,7 @@ curl -X POST https://uaip.cc.cd/api/admin/articles ^
 | `GET /api/relay/channels` | 目前可用的中轉管道清單（含各管道的模型名稱 `models`；不含金鑰） |
 | `GET /api/playground/models` | Playground 可選的模型清單（依渠道分組；要有 playground 服務） |
 | `POST /api/playground/chat` | Playground 聊天（SSE 串流；要有 playground 服務，見 §5f） |
+| `POST /api/playground/chat/save` | 直通模式下由前端回報回覆內容與 token 用量（見 §5f「串流直通」） |
 | `GET /api/playground/conversations` | 自己的 Playground 對話列表 |
 | `GET/PUT/DELETE /api/playground/conversations/{id}` | 讀取訊息／改名／刪除自己的對話 |
 | `POST /api/playground/files` | 上傳聊天附件圖片（本體＝raw base64，見 §5f） |
@@ -293,6 +294,7 @@ curl -X PUT https://uaip.cc.cd/api/admin/menu ^
 | `quota_pg_day` | Playground 每日訊息數的全域預設；`null` ＝ 內建預設 200 |
 | `rl_per_min` | 每分鐘請求數上限（滾動 60 秒、中轉＋Playground 合併計）；`null` ＝ 內建預設 30 |
 | `relay_meter` | `false` ＝ 中轉退回**純直通**（不掃 usage、不寫 req_log）— 計量出怪問題時的免部署保險；`true` ＝ 恢復計量（預設）。平常不要動 |
+| `pg_passthrough` | `false` ＝ Playground 串流全部走**轉譯路徑**（v2.4 行為：CPU 貴但語意完整）；`true` ＝ 恢復直通（預設）。直通出怪問題時的免部署保險，見 §5f「串流直通」與 [ADR-0014](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/docs/adr/0014-native-passthrough-streaming.md) |
 | `tg_bot_token` | Telegram 告警的 bot token（2026-07-17 起可存這裡；最長 100 字，**空字串＝刪鍵**）。cron 每 5 分鐘掃 errlog 推播時**這裡優先**、Cloudflare secrets（TG_BOT_TOKEN）後備。回讀一律遮罩（`tg_token_set`／`tg_token_hint`）、audit 不落明文。網頁在 /settings 的「Telegram 告警」卡 |
 | `tg_chat_id` | Telegram 告警的 chat id（最長 50 字，空字串＝刪鍵；同樣 D1 優先、secrets TG_CHAT_ID 後備）。token 與 chat id **都設好**告警才會發送 |
 | `demo_mode` | `true`／`false` — **Playground 體驗模式**（2026-07-17 v2.0.0）：開啟後**未登入訪客**可直接在 /playground 試聊。要同時設好 `demo_channel` 才生效。fail-closed 限流（詳見 ADR-0009）：每 IP 每分鐘／每日＋全站每日三道上限，限流器故障時直接 503 絕不放行 |
@@ -509,12 +511,57 @@ Authorization: Bearer uak-你的金鑰
   - **不帶 `conv_id`＝自動開新對話**（標題取第一句 user 訊息），對話編號由 SSE 第一筆事件回傳。
   - `model` 一定要在該渠道的 `models` 清單裡，否則 400 `bad-model`。
   - 回應是 SSE（`text/event-stream`），每筆 `data:` 都是 JSON：`{conv,title?}` →（多筆）`{r:"思考增量"}`／`{d:"增量文字"}` → `{done:true}`；中途出錯是 `{error,hint}`（已生成的部分照存）。上游一開始就失敗則直接回 JSON 錯誤（會帶 `conv`）。
+    > **2026-07-31 v2.5 起這是「轉譯路徑」的形狀**。openai／custom 渠道預設改走**直通**，收到的是上游的原始 chunk，客戶端要兩種都認得 —— 完整規則見下面的「串流直通」。
   - **`{r:…}` 是推理模型的思考過程**（2026-07-21）：GLM／DeepSeek 系的 `reasoning_content`、OpenRouter 的 `reasoning`、anthropic 的 `thinking_delta`、gemini 標了 `thought` 的 part，一律轉成 `r` 事件。思考內容**不寫進 `pg_messages`**（存的只有正式回覆），重新載入舊對話時不會再出現。非推理模型完全不會有 `r` 事件。
     > 這個欄位以前被丟掉，導致推理模型在思考期間瀏覽器收不到任何東西 — 畫面空白數十秒像當機，模型若把輸出預算全花在思考上更是「沒回覆、沒報錯」就結束。
   - **整趟沒有任何正式內容**（`d` 一次都沒來）→ 回 `{error:"empty-output", hint}`，不會靜默送 `done`。有收過思考的話 `hint` 會說明是「只輸出思考過程」。此錯誤不含上游身分，**會員看得到全文**。
   - 中斷連線（前端按「停止」）＝停止生成，已生成的內容照樣存進對話。
   - 伺服器依渠道 kind 自動轉換請求／串流格式：openai、custom → `/v1/chat/completions`；anthropic → `/v1/messages`；gemini → `/v1beta/models/{model}:streamGenerateContent?alt=sse`。
   - **錯誤訊息對會員做了消毒**（2026-07-14）：上游的原始錯誤內容（錯誤格式、文件連結、專案編號）會洩漏真實提供商身分，所以會員只看得到安全分類字（401/403→「渠道憑證可能失效」、429→「上游流量限制」、5xx→「上游暫時故障」…），`detail` 原文**只有管理員**（is_admin 或管理金鑰）看得到。
+
+### 串流直通（2026-07-31 v2.5.0，[ADR-0014](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/docs/adr/0014-native-passthrough-streaming.md)）
+
+`POST /api/playground/chat` 有**兩種回應格式**，由伺服器逐次決定，回應標頭 `x-pg-mode` 會說是哪一種：
+
+| | 轉譯（v2.4 以來的行為） | **直通**（v2.5 新增，預設） |
+|---|---|---|
+| `x-pg-mode` | 沒有這個標頭 | `passthrough` |
+| 事件形狀 | `{conv,title?}` →`{r}`／`{d}`→ `{done:true}` | `{conv,title?,mode,log}` → **上游原始 chunk** → `data: [DONE]` |
+| 誰在解析 | 伺服器 | 客戶端 |
+| 回覆落地 | 伺服器自己寫 D1 | **客戶端回報**（`POST /api/playground/chat/save`） |
+| 線上 CPU | 626 ms（20 秒串流） | **6 ms**（51 秒串流） |
+
+直通就是把上游的 SSE 原封不動轉推出來 —— Worker 只在開頭讀幾個 chunk 確認形狀，之後一個位元組都不再碰。
+免費方案每次呼叫只有 10 ms CPU，而轉譯路徑的 CPU 跟串流長度成正比，長回覆（尤其多圖多輪）會直接把 isolate 燒掉、串流無聲截斷。這是 v2.5 的全部理由。
+
+**什麼時候會直通**（任何一條不成立就退回轉譯，不確定一律走轉譯）：
+
+- 渠道 `kind` 是 `openai` 或 `custom`（`anthropic`／`gemini` 的串流形狀不同）
+- 上游真的回 `text/event-stream`
+- 不在 dumb mode、不是體驗模式（原始 chunk 帶 `"model":"真名"`，會洩漏刻意隱藏的模型）
+- 站台設定 `pg_passthrough` 沒被關掉（見 §5）
+- **嗅探通過**：開頭的 chunk 是合法 JSON、沒有 `error`、頂層欄位都在白名單內
+  （`id`／`object`／`created`／`model`／`choices`／`usage`／`system_fingerprint`／`service_tier`／`obfuscation`／`prompt_token_ids`／`prompt_logprobs`）。
+  出現白名單外的欄位就退回轉譯 —— 例如 OpenRouter 每筆都帶的 `"provider":"DeepInfra"`、Groq 的 `x_groq`，那等於直接寫著上游是誰。
+
+管理員可用 `?stream=transform` 或 `?stream=passthrough` 強制單一路徑（A/B 與除錯用；會員帶了無效）。
+
+**直通模式的回應標頭**：`x-pg-conv`（對話編號）、`x-pg-log`（這趟的 `req_log` 列編號）、`x-pg-mode: passthrough`。
+上游的標頭一個都不會轉出來。
+
+- `POST /api/playground/chat/save` 本體：
+
+```json
+{ "conv_id": 12, "log_id": 345, "content": "模型的完整回覆",
+  "tokens_in": 115, "tokens_out": 3066, "dur_ms": 20450, "status": "ok" }
+```
+
+  - **只有直通模式需要呼叫**（轉譯路徑伺服器自己會存）。驗證同 `chat`（登入 cookie 或管理金鑰）。
+  - `content` 是這一則 assistant 回覆的完整文字（思考過程不存，跟轉譯路徑一致）；空字串＝只更新計量、不建訊息。
+  - `status` 只收 `ok`／`empty-output`／`upstream-error`／`aborted`（**固定清單**：這條路徑的內容全由瀏覽器決定，開放自由字串等於讓會員往站內錯誤紀錄寫東西）。
+  - **冪等**：同一則對話的最後一列已經是 assistant 就改寫那一列，而且**只有變長才覆寫** —— 關網頁時 `sendBeacon` 送的半截內容不會蓋掉已經存好的完整回覆。回 `{ ok, saved:"insert"|"update"|"skip" }`。
+  - `log_id` 用來把 token 用量與總耗時補回 `req_log`；**只補得了一次**（`tokens_out` 已有值就不再改），而且只動自己的列。
+  - 換來的代價（誠實列出）：直通模式**沒有「關掉網頁後在背景把回覆跑完」**（那是轉譯路徑才做得到的，見 ADR-0012）。前端改在 `pagehide` 用 `sendBeacon` 送出「已經收到的部分」，超過 64KB 的部分送不出去（瀏覽器對 beacon 的硬限制）。
 
 ### 附件（2026-07-29 v2.3.0）
 

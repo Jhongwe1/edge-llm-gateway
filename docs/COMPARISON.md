@@ -61,7 +61,7 @@
 - **Fully owned, fully readable.** Every line that runs in production is in this repo and
   reviewable in an afternoon. No hosted dependency can change pricing, deprecate an endpoint,
   or read the traffic.
-- **Honest engineering evidence.** 548 tests in the real runtime, a threat model, thirteen
+- **Honest engineering evidence.** 572 tests in the real runtime, a threat model, thirteen
   ADRs, a two-round security audit that reports its own first-round miss rate, and this
   comparison — the artifact is meant to be defensible, not just functional.
 
@@ -79,7 +79,7 @@ don't.
 **中文摘要**：這不是「我們贏」的表。one-api／LiteLLM／OpenRouter／AI Gateway 都成熟、
 多人維護，解的是 uaip 刻意不解的問題（BYOK、路由容錯、真實計費、上百家供應商廣度）。
 uaip 的架構換到的是：零伺服器零依賴、一顆 D1 一個心智模型、中轉與門戶／會員／配額／
-稽核一體、全碼自持可審、可論述的工程證據（548 條測試＋威脅模型＋13 份 ADR＋
+稽核一體、全碼自持可審、可論述的工程證據（572 條測試＋威脅模型＋13 份 ADR＋
 會自報漏檢率的兩輪稽核）。**計價只做報表、不做執法**：配額算的仍是「次數」，
 所以同一個額度下用貴模型就是燒比較多錢 —— 那是刻意的取捨，不是漏做。
 需要路由／容錯／計費／百家供應商 → 用 LiteLLM 或 one-api；uaip 的定位是「一個人想在

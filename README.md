@@ -54,19 +54,50 @@ generation nobody will see — `tee()` would keep paying for it.
 **3. The free plan gives you 10 ms of CPU per invocation, and exceeding it kills the
 isolate silently.**
 No catchable error, no `req_log` row, no `errlog` entry — replies just stopped mid-sentence
-and nothing in the application could see why. Only `wrangler tail` shows it. The fix was
-not "make it faster" but "stop doing work per delta": writes are batched on a 100 ms /
-1 000-character threshold, and parsing uses a regex fast path that extracts the one string
-we need instead of materializing a ~17-object tree per chunk — so V8 allocates one string
-and the GC has nothing to collect. (GC pauses are billed to the same budget, which is why
-allocation costs twice.) Reproduce it yourself: `npm run bench`.
-[ADR-0011](./docs/adr/0011-streaming-cpu-budget.md)
+and nothing in the application could see why. Only `wrangler tail` shows it.
+
+The first two rounds of work made the per-chunk loop as cheap as it can be: writes batched
+on a 100 ms / 1 000-character threshold, and a regex fast path that extracts the one string
+we need instead of materializing a ~17-object tree per chunk
+([ADR-0011](./docs/adr/0011-streaming-cpu-budget.md)). It wasn't enough — long answers still
+died. So we measured the thing nobody had measured: **what if JS never touches the bytes at
+all?** Same prompt, same model, CPU from `wrangler tail`:
+
+| how the response body is delivered | chunks | wall | CPU |
+|---|---|---|---|
+| read + parse + batched writes in JS | ~3 000 | 20.3 s | **626 ms** |
+| `new TransformStream()` + `pipeTo` | 3 683 | 23.9 s | **1 001 ms** |
+| `new IdentityTransformStream()` + `pipeTo` | 3 068 | 20.8 s | **5 ms** |
+
+So v2.5 **sniffs the first few chunks in JS — enough to prove the stream is a clean,
+OpenAI-shaped SSE with no field that names the upstream — then hands the rest to the
+runtime**. CPU stops being a function of how long the model talks: 7 895 chunks over 51
+seconds cost 6 ms. The case that prompted the work — four 1.4 MB images plus a long prompt —
+went from 615 ms to 59 ms, and the 59 ms that remains is the *request* side (splicing 5.75 MB
+of base64 into the upstream body), a one-off cost that doesn't grow with the reply.
+
+The middle row is the point of the whole exercise. `new TransformStream()` is JS-backed —
+every chunk crosses into JS and back — so the obvious implementation would have been
+**worse than doing nothing** while looking correct in review, in tests, and in a local
+workerd bench (which under-reports by ~95×, having no HTTP/2 framing, no TLS, no socket).
+Only Cloudflare's `IdentityTransformStream` is a native pipe. That is not a detail you can
+reason your way to. [ADR-0014](./docs/adr/0014-native-passthrough-streaming.md)
+
+Passthrough is not free: the Worker can no longer see the reply, so persistence and token
+usage move to the client, and "keep generating after the tab closes" is gone on that path.
+The `req_log` row is still written server-side before the pipe starts, so no request can
+vanish from the ledger. Channels that don't qualify — Anthropic, Gemini, hidden-model
+modes, or any stream whose head carries an unknown top-level field like OpenRouter's
+`provider` — fall back to the transform path, which keeps every one of those semantics.
+One setting (`pg_passthrough`) turns the whole thing off without a deploy.
 
 A fourth, smaller one worth naming: **the client disconnecting shouldn't lose the reply.**
 Closing the tab does not cancel a Workers response stream — `writer.write()` simply never
 settles, so the request hangs until the platform kills it and takes the D1 writes with it.
 Detection is a write-timeout circuit breaker, and generation continues on a budget so the
 answer is complete when you come back. [ADR-0012](./docs/adr/0012-finish-reply-after-disconnect.md)
+(On the passthrough path there is nothing to continue — the browser reports what it got
+via `sendBeacon` instead.)
 
 ## Also on the same Worker
 
@@ -123,6 +154,7 @@ Design decisions are recorded as ADRs — the honest trade-offs, not just the wi
 - [ADR-0011 Staying on the free plan — the 10 ms CPU budget for streaming](./docs/adr/0011-streaming-cpu-budget.md)
 - [ADR-0012 Finishing the reply after the client disconnects](./docs/adr/0012-finish-reply-after-disconnect.md)
 - [ADR-0013 R2 is optional — attachments run in two storage modes](./docs/adr/0013-r2-optional-attachments.md)
+- [ADR-0014 Stream passthrough — sniff the head, then let the runtime pump the rest](./docs/adr/0014-native-passthrough-streaming.md)
 
 Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Security audit, two rounds + the miss rate of the first](./docs/AUDIT-2026-07.md) ·
@@ -130,9 +162,9 @@ Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Honest comparison vs one-api / LiteLLM / OpenRouter / AI Gateway](./docs/COMPARISON.md) ·
 [Known debt](./DEBT.md) · [Security policy](./SECURITY.md)
 
-## Engineering evidence (v2.4.1)
+## Engineering evidence (v2.5.0)
 
-- **548 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
+- **572 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced
@@ -239,7 +271,9 @@ npm run seed              # optional: local admin/member/channel seed
 npm run dev               # http://localhost:8787
 npm run checks            # eslint + typecheck + tests
 npm run e2e               # Playwright (spins up mock upstream + wrangler dev itself)
-npm run bench             # reproduce the ADR-0011 CPU numbers
+npm run bench             # reproduce the ADR-0011 parsing-side CPU numbers
+npm run bench:workerd     # the same loop inside real workerd (still a lower bound —
+                          #   only `wrangler tail` sees the real CPU, see ADR-0014)
 npm run loadtest          # 200 concurrent requests at the rate limiter DO
 npm run deploy            # rebuild apidoc + openapi, then wrangler deploy
 npm run migrate:remote    # apply new migrations to production (run BEFORE deploy)

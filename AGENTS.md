@@ -22,7 +22,7 @@
 | 設會員／全域配額（v1.0.0） | `PUT /api/admin/users/{id} {"action":"set_quota",…}`（個人）、`PUT /api/admin/settings {"quota_relay_day":…}`（全域） |
 | 加／改 API 中轉管道（含模型清單） | `POST/PUT/DELETE /api/admin/relay/channels…`（`models` 必填） |
 | 加／改 VPN 渠道 | `POST/PUT/DELETE /api/admin/vpn/channels…` |
-| 測 Playground | `POST /api/playground/chat`（管理金鑰可直接測，SSE 串流；`{r}`＝思考、`{d}`＝正文） |
+| 測 Playground | `POST /api/playground/chat`（管理金鑰可直接測，SSE 串流）。**v2.5 起有兩種回應格式，看回應標頭 `x-pg-mode`**：沒有＝轉譯（`{r}`＝思考、`{d}`＝正文）；`passthrough`＝上游原始 chunk 直通，此時要自己解 `choices[].delta` 並呼叫 `POST /api/playground/chat/save` 落地。管理員可用 `?stream=transform` 強制舊格式 |
 
 > **v1.0.0（2026-07-14）新增**：中轉／Playground 有**每人每日配額＋每分鐘限流**（管理員豁免；超額 429＋Retry-After），
 > 用量記在 req_log、看得到 token 與延遲；所有管理員變更寫**稽核日誌**；VPN 對未授權者**隱形**

@@ -271,6 +271,10 @@ const PG_JS = `
   var dumbVision=false;// dumb 模式下前端不知道模型是誰，只由伺服器告知「能不能附圖」
   var dumbImgmax=0;    // 同上：dumb 模式下的「單則最多幾張圖」（0＝伺服器沒說，不特別限制）
   var streaming=false,aborter=null;
+  /* v2.5 直通模式（ADR-0014）：伺服器把上游串流原樣轉推過來，Worker 看不到內容 ——
+     所以「回覆落地」與「token 用量」都由這裡回報。livePt 是目前這一趟的狀態，
+     關網頁時（pagehide）靠它把已收到的部分用 sendBeacon 送回去。 */
+  var livePt=null;
   var UI={};
   var model="";        // 目前選的模型（"channelSlug|modelName"）
   var coarse=!!(window.matchMedia&&matchMedia("(pointer:coarse)").matches);
@@ -1064,6 +1068,9 @@ const PG_JS = `
 
     var node=addAiMsg("",false);
     var got="";
+    /* 這一趟的直通狀態（v2.5）。on 要等收到回應標頭才知道 —— 在那之前一律當轉譯路徑，
+       所以就算伺服器把直通關掉，這裡的行為也自動退回 v2.4，不必改前端。 */
+    var pt={on:false,log:0,tin:null,tout:null,text:"",status:"ok",saved:false,t0:Date.now()};
     setStreaming(true);
     aborter=("AbortController" in window)?new AbortController():null;
 
@@ -1093,6 +1100,16 @@ const PG_JS = `
           throw er;
         });
       }
+      /* 伺服器用標頭告訴我們這一趟走哪條路（v2.5）：
+           x-pg-mode=passthrough → 下面收到的是**上游的原始 chunk**，而且落地要自己回報
+           沒有這個標頭          → 轉譯路徑，跟 v2.4 完全一樣，伺服器已經存好了
+         同一頁可能一則直通、一則轉譯（換到 anthropic／gemini 渠道就會切換），
+         所以兩種格式都要認得，不能二選一。 */
+      if(r.headers.get("x-pg-mode")==="passthrough"){
+        pt.on=true;
+        pt.log=parseInt(r.headers.get("x-pg-log")||"0",10)||0;
+        livePt=pt;
+      }
       var reader=r.body.getReader(),dec=new TextDecoder(),buf="";
       function pump(){
         return reader.read().then(function(s){
@@ -1103,24 +1120,71 @@ const PG_JS = `
             var line=buf.slice(0,i).replace(/\\r$/,"");buf=buf.slice(i+1);
             if(line.indexOf("data:")!==0)continue;
             var p=line.slice(5).trim();
-            if(!p)continue;
+            if(!p||p==="[DONE]")continue;   /* [DONE] 是上游的收尾訊框（直通才看得到） */
             var j=null;try{j=JSON.parse(p);}catch(e){continue;}
+            /* ── 直通：上游原始形狀 {choices:[{delta:{content|reasoning_content}}]} ── */
+            if(j.choices){
+              var c0=j.choices[0],dl=c0&&c0.delta;
+              if(dl){
+                var rc=dl.reasoning_content||dl.reasoning;
+                if(rc){var th2=ensureThink(node);th2.text+=rc;thinkPaint(th2);}
+                if(dl.content){thinkDone(node);got+=dl.content;pt.text=got;streamPaint(node,got);}
+              }
+              /* 上游的 usage 訊框（我們自己加的 stream_options.include_usage）——
+                 直通模式伺服器看不到它，只有這裡收得到，串完要交回去補進 req_log。 */
+              if(j.usage){
+                if(typeof j.usage.prompt_tokens==="number")pt.tin=j.usage.prompt_tokens;
+                if(typeof j.usage.completion_tokens==="number")pt.tout=j.usage.completion_tokens;
+              }
+              continue;
+            }
+            /* ── 轉譯：伺服器統一過的極簡形狀（也含直通的第一筆 {conv}）── */
             if(j.conv&&!cur){cur=j.conv;afterConvCreated();}
+            if(j.log&&!pt.log)pt.log=j.log;
             if(j.r){var th=ensureThink(node);th.text+=j.r;thinkPaint(th);}
             // 正文第一個字＝思考階段結束（沒思考過的話這是 no-op）
-            if(j.d){thinkDone(node);got+=j.d;streamPaint(node,got);}
-            if(j.error){thinkDone(node);showErr(node,j.hint||j.error,j.contact_url);}
+            if(j.d){thinkDone(node);got+=j.d;pt.text=got;streamPaint(node,got);}
+            if(j.error){
+              thinkDone(node);
+              /* 直通模式下這是**上游的原文**（會露出提供商身分）。伺服器那條路有 safeHint
+                 幫忙淨化，直通沒有，所以分界移到這裡：管理員看全文，會員看安全字。 */
+              var em=j.hint||(j.error&&j.error.message)||j.error;
+              if(pt.on&&!(me&&me.is_admin))em=tx("上游發生錯誤，請稍後再試","Upstream error, please try again");
+              showErr(node,String(em),j.contact_url);
+              pt.status="upstream-error";
+            }
           }
           return pump();
         });
       }
       return pump();
     }).catch(function(e){
-      if(!(e&&e.name==="AbortError"))showErr(node,String(e&&e.message||e),e&&e.contactUrl);
+      if(e&&e.name==="AbortError")pt.status="aborted";
+      else{showErr(node,String(e&&e.message||e),e&&e.contactUrl);pt.status="upstream-error";}
     }).then(function(){
-      finishStream(node,got);
+      finishStream(node,got,pt);
     });
   }
+  /* 直通模式的落地回報。beacon＝關網頁那一刻用 sendBeacon（不保證送達，但比什麼都不做好）。
+     ⚠ sendBeacon 與 keepalive fetch 都有 64KB 本體上限 —— 超長回覆在「關網頁」這條路上
+     會送不出去（正常串完那條路沒有這個限制）。這是已知邊界，記在 DEBT。 */
+  function ptSave(pt,conv,text,status,beacon){
+    if(!pt||!pt.on||!conv||pt.saved)return;
+    if(!text&&status==="ok")status="empty-output";
+    var body=JSON.stringify({conv_id:conv,log_id:pt.log||0,content:text||"",
+      tokens_in:pt.tin,tokens_out:pt.tout,dur_ms:Date.now()-pt.t0,status:status});
+    if(beacon&&navigator.sendBeacon){
+      try{navigator.sendBeacon("/api/playground/chat/save",new Blob([body],{type:"application/json"}));return;}catch(e){}
+    }
+    pt.saved=true;
+    fetch("/api/playground/chat/save",{method:"POST",headers:{"content-type":"application/json"},body:body})
+      .catch(function(){pt.saved=false;});
+  }
+  /* 關掉分頁／切到背景：把已經收到的部分先送回去。轉譯路徑不需要這個（伺服器自己會存，
+     而且還會在背景把回覆跑完 —— 那是直通模式換不到的東西，見 ADR-0014）。 */
+  window.addEventListener("pagehide",function(){
+    if(livePt&&livePt.on&&!livePt.saved)ptSave(livePt,cur,livePt.text||"","aborted",true);
+  });
   /* 新對話在伺服器端建立完成：更新側欄 History＋右上「⋯」（體驗模式沒有側欄歷史） */
   function afterConvCreated(){
     updateMore();
@@ -1145,9 +1209,12 @@ const PG_JS = `
     if(contact)er.appendChild(MU.contactBtn(contact));
     node.box.appendChild(er);
   }
-  function finishStream(node,got){
+  function finishStream(node,got,pt){
     setStreaming(false);aborter=null;
     thinkDone(node); // 只思考沒正文時，這裡才會是結束思考的時機
+    /* 直通模式：伺服器沒看過這段內容，由這裡交回去落地（含 token 用量）。
+       放在最前面 —— 後面的 Markdown／數學渲染萬一丟例外，回覆也已經送出去了。 */
+    if(pt&&pt.on){ptSave(pt,cur,got,pt.status,false);livePt=null;}
     if(got){
       msgs.push({role:"assistant",content:got,model:modelName()});
       node.md.innerHTML=mdRender(got);

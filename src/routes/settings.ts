@@ -113,6 +113,13 @@ const BODY = `
     </div>
     <div class="swrow">
       <div class="g">
+        <div class="t1">串流直通（v2.5）</div>
+        <div class="t2">開啟＝OpenAI 相容渠道的回應由 runtime 原生轉推（線上實測 CPU 626ms→6ms，長回覆才不會被靜默截斷）。關閉＝全部退回舊的轉譯路徑，直通出怪問題時的免部署保險 — <b>平常不要動</b>。</div>
+      </div>
+      <button id="tglPgPt" class="tgl" type="button">—</button>
+    </div>
+    <div class="swrow">
+      <div class="g">
         <div class="t1">體驗模式（未登入試聊）</div>
         <div class="t2">開啟後未登入訪客可直接在 /playground 試聊。<b>要同時選好下面的渠道才會生效</b>；試聊的對話會進「訪客紀錄 → 對話紀錄」給你看（訪客自己看不到歷史）、三道限流保險。</div>
         <div id="demoState" class="t2"></div>
@@ -359,6 +366,7 @@ const PAGE_JS = `
     paintTgl($("tglDumb"),st.dumb_mode);
     paintTgl($("tglVpnPub"),st.vpn_public);
     paintTgl($("tglMeter"),st.relay_meter);
+    paintTgl($("tglPgPt"),st.pg_passthrough);
     demoStateNote();
     dumbStateNote();
     fillDumbSel();
@@ -511,6 +519,7 @@ const PAGE_JS = `
         if(key==="dumb_mode")st.dumb_mode=next;
         if(key==="vpn_public")st.vpn_public=next;
         if(key==="relay_meter")st.relay_meter=next;
+        if(key==="pg_passthrough")st.pg_passthrough=next;
         paintTgl(btn,next);demoStateNote();dumbStateNote();
         flash("已"+(next?"開啟":"關閉"));
       }).catch(function(e){btn.disabled=false;err(e);});
@@ -521,6 +530,7 @@ const PAGE_JS = `
   bindTgl($("tglDumb"),"dumb_mode",function(){return st.dumb_mode;});
   bindTgl($("tglVpnPub"),"vpn_public",function(){return st.vpn_public;});
   bindTgl($("tglMeter"),"relay_meter",function(){return st.relay_meter;});
+  bindTgl($("tglPgPt"),"pg_passthrough",function(){return st.pg_passthrough;});
 
   /* ===== 各卡儲存 ===== */
   function saving(btn,msgEl,p,onOk){

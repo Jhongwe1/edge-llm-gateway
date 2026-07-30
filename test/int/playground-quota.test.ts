@@ -72,6 +72,11 @@ describe("playground 計量（三家 usage 進 req_log）", () => {
   }
 
   it("openai：stream_options.include_usage 讓尾端帶 usage → req_log 有 tokens", async () => {
+    // v2.5：openai 渠道預設走直通，伺服器看不到 usage 訊框（改由前端回報，見
+    // routes/api/playground/chat/save.ts）。這一則測的是**轉譯路徑**的計量，所以先關直通。
+    await env.DB.prepare(
+      "INSERT INTO settings (k,v) VALUES ('pg_passthrough','0') ON CONFLICT(k) DO UPDATE SET v=excluded.v"
+    ).run();
     const sse =
       'data: {"choices":[{"delta":{"content":"a"}}]}\n\n' +
       'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22}}\n\n' +

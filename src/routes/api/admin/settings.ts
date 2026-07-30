@@ -16,6 +16,9 @@
 //            正整數＝覆寫程式內建預設（src/lib/quota.ts QUOTA_DEFAULTS）；null 或空字串＝刪鍵＝回到內建。
 //   relay_meter: true/false — 中轉計量 pump 的總開關（false 存 '0'＝退回純直通；true＝刪鍵＝預設開）。
 //            計量 pump 出怪問題時的免部署保險，平常不要動。
+//   pg_passthrough: true/false — Playground 串流直通（v2.5，ADR-0014）。false 存 '0'＝
+//            全部走轉譯路徑（v2.4 行為，CPU 貴但語意完整：錯誤淨化、usage、斷線續跑）；
+//            true＝刪鍵＝預設開。直通出怪問題時的免部署保險，跟 relay_meter 同一套語意。
 //   tg_bot_token / tg_chat_id（2026-07-17 /settings 頁）：Telegram 告警憑證改可存 D1 —
 //            cron tgAlertScan 讀取 **D1 優先、Cloudflare secrets 後備**；空字串＝刪鍵。
 //            token 回讀一律遮罩（tg_token_set/tg_token_hint）、audit 不落明文。
@@ -58,6 +61,8 @@ const ALL_KEYS = [
   "pg_open",
   "pg_default_system",
   "relay_meter",
+  // Playground 串流直通的總開關（2026-07-31 v2.5，ADR-0014）。0＝關；沒設＝開。
+  "pg_passthrough",
   "demo_mode",
   "demo_channel",
   "demo_models",
@@ -140,7 +145,7 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
   const store = activeStore(env); // 附件存哪：有 FILES 綁定＝r2，沒有＝d1
   try {
     const res = await env.DB.prepare(
-      "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_open','pg_default_system','relay_meter'," +
+      "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_open','pg_default_system','relay_meter','pg_passthrough'," +
         "'quota_relay_day','quota_pg_day','rl_per_min','tg_bot_token','tg_chat_id'," +
         "'demo_mode','demo_channel','demo_models','demo_per_min','demo_per_ip_day','demo_global_day','demo_max_tokens'," +
         "'dumb_mode','dumb_channel','dumb_model','vpn_public'," +
@@ -163,6 +168,7 @@ export async function onRequestGet(context: RouteCtx): Promise<Response> {
       // 沒設過回空字串（不是內建那段）— 前端把內建放 placeholder，空欄就代表「用內建」。
       pg_default_system: st.pg_default_system || "",
       relay_meter: st.relay_meter !== "0",
+      pg_passthrough: st.pg_passthrough !== "0",
       quota_relay_day: numOrNull(st.quota_relay_day),
       quota_pg_day: numOrNull(st.quota_pg_day),
       rl_per_min: numOrNull(st.rl_per_min),
@@ -367,6 +373,11 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
         del("relay_meter"); // 預設就是開
       else put("relay_meter", "0");
     }
+    if ("pg_passthrough" in body) {
+      if (body.pg_passthrough)
+        del("pg_passthrough"); // 預設就是開
+      else put("pg_passthrough", "0");
+    }
     // —— demo 體驗模式（Phase K）——
     if ("demo_mode" in body) {
       if (body.demo_mode) put("demo_mode", "1");
@@ -476,7 +487,7 @@ export async function onRequestPut(context: RouteCtx): Promise<Response> {
 
     // 回傳改完的現況（settings 沒鍵時顯示內建預設）
     const res = await env.DB.prepare(
-      "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_default_system','quota_relay_day','quota_pg_day','rl_per_min','relay_meter','demo_channel','demo_models','tg_bot_token','tg_chat_id','dumb_mode','dumb_channel','dumb_model','vpn_public')"
+      "SELECT k,v FROM settings WHERE k IN ('brand','contact_url','pg_default_system','quota_relay_day','quota_pg_day','rl_per_min','relay_meter','pg_passthrough','demo_channel','demo_models','tg_bot_token','tg_chat_id','dumb_mode','dumb_channel','dumb_model','vpn_public')"
     ).all();
     const st: Record<string, string> = {};
     ((res.results || []) as { k: string; v: string }[]).forEach(function (r) {

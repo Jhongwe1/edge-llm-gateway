@@ -1,5 +1,5 @@
 // POST /api/playground/chat — SSE 快樂路徑、D1 持久化、錯誤淨化（會員看不到上游身分）。
-import { describe, it, expect, beforeAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { env, fetchMock } from "cloudflare:test";
 import { onRequestPost, BG } from "../../src/routes/api/playground/chat.js";
 import { createSession } from "../../src/lib/auth.js";
@@ -22,6 +22,16 @@ beforeAll(() => {
   fetchMock.disableNetConnect();
 });
 afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+// v2.5 起 openai 渠道**預設走直通**（伺服器不再看內容，見 lib/pgstream.ts）。
+// 這一整支測的是「轉譯路徑」的語意 —— 錯誤淨化、usage、批次合併、斷線續跑 ——
+// 那條路現在只剩 anthropic／gemini／dumb／demo／嗅探沒過才會走到，所以這裡明確
+// 把直通關掉。直通本身的行為在 test/int/pgstream.test.ts。
+beforeEach(async () => {
+  await env.DB.prepare(
+    "INSERT INTO settings (k,v) VALUES ('pg_passthrough','0') ON CONFLICT(k) DO UPDATE SET v=excluded.v"
+  ).run();
+});
 
 async function chatCtx(user: UserRow, body: unknown) {
   const sess = await createSession(env, user, new URL(ORIGIN + "/"));
