@@ -1,7 +1,8 @@
 # Threat Model / 威脅模型
 
-> STRIDE analysis of every trust boundary in uaip.cc.cd (v2.0.0, 2026-07).
-> English first; 繁體中文在後半。Scope: the Cloudflare Workers app (worker + D1 + static assets).
+> STRIDE analysis of every trust boundary in uaip.cc.cd. Written at **v2.0.0 (2026-07)**;
+> §2.7c and §4.5–4.6 added at **v2.6.0 (2026-08)** — changelog at the end of §4.
+> English first; 繁體中文在後半。Scope: the Cloudflare Workers app (worker + D1 + Durable Objects + static assets).
 > Out of scope: Cloudflare platform itself, Google OAuth infrastructure, upstream LLM/VPN providers' internals.
 
 ## 1. System sketch
@@ -11,11 +12,16 @@ Browser ──(HTTPS)── Cloudflare Workers
   ├─ static SPA (/, /ip, /ua)            ← _headers CSP (sha256)
   ├─ SSR pages via src/lib/site.ts html() ← per-request nonce CSP
   └─ Worker routes (src/routes/)
+      ├─ router.ts      visitLog() runs BEFORE dispatch → one D1 row per HTML request (§4.5)
       ├─ /auth/*        Google OAuth code flow, HttpOnly session cookie (sid hashed in D1)
       ├─ /api/*         member APIs (cookie + Origin check) / admin APIs (Bearer LOGS_TOKEN or admin cookie)
       ├─ /relay/*       LLM gateway: member key (uak-) → upstream key swap, streaming passthrough
       └─ /vpn/sub/*     subscription mirror: capability token in URL
-D1 (single database): users, sessions, req_log, errlog, audit_log, content tables
+Durable Objects — reachable ONLY through a binding, never routable from outside (§2.7c)
+  ├─ RateLimiter  u:<member> · demo-ip:<ip> · demo:global · csp-ip:<ip>  atomic quota counting
+  └─ PgStream     pg:u:<member>  playground SSE transform (30 s CPU); receives ch.api_key
+D1 (single database): users, sessions, req_log, errlog, audit_log, visits, content tables
+R2 (optional): FILES (attachments) · BACKUPS (daily JSONL — see §4.2)
 Secrets: GOOGLE_CLIENT_ID/SECRET, ADMIN_EMAILS, LOGS_TOKEN (wrangler secrets)
 ```
 
@@ -70,7 +76,8 @@ Secrets: GOOGLE_CLIENT_ID/SECRET, ADMIN_EMAILS, LOGS_TOKEN (wrangler secrets)
 - Upstream errors are sanitized for members (provider identity hidden); admins see raw detail.
 - Client abort → upstream reader cancelled (no orphaned paid generation).
 - Persistence failures logged (`pg.persist`); partial responses saved.
-- Output rendered client-side with marked + a DOM sanitizer (script/style/iframe stripped, `on*` attributes and js: URLs removed); the chat area is script-free content, so a malicious upstream injecting HTML gets no nonce and is blocked by CSP.
+- Output rendered client-side with marked + a DOM sanitizer that removes the `<script>`, `<style>`, `<iframe>`, `<object>`, `<embed>`, `<link>`, `<meta>`, `<form>` and `<base>` **elements**, all `on*` attributes, and `javascript:`/`vbscript:`/`data:` in `href`/`src`. The chat area is script-free content, so a malicious upstream injecting HTML gets no nonce and is blocked by CSP.
+- ⚠ That sanitizer is a **blacklist**, unlike the server-side whitelist in `lib/sanitize.ts`, and it does **not** strip the `style` **attribute** (distinct from the `<style>` element above). Script execution is still prevented, but CSS-only UI redress inside the authenticated origin is not — see §4.6.
 
 ### 2.7b Anonymous demo mode (v2.0.0, ADR-0009)
 - Attack surface: unauthenticated `POST /api/playground/chat` pointed at a paid upstream.
@@ -78,6 +85,35 @@ Secrets: GOOGLE_CLIENT_ID/SECRET, ADMIN_EMAILS, LOGS_TOKEN (wrangler secrets)
 - Double **fail-closed** rate limit in the RateLimiter DO (per-IP minute/day + site-wide day); DO failure → 503, never allow — the inverse of the member path's fail-open, deliberately.
 - Conversations and accounting both go to a synthetic `demo:public` user row that can never log in. Visitors have **no read path** (list/read/delete all run `pgUser` → 401 for anonymous, own-`user_id` for members), so no visitor can read their own or another visitor's demo chat; only the admin log shows them.
 - Worst-case daily burn is bounded by `demo_global_day ×` the per-reply cap; with `demo_max_tokens` unset the request-count half is the whole backstop (it is the half that always held anyway). One settings write kills the surface without a deploy.
+
+### 2.7c Worker → Durable Object handoff (v2.6.0, ADR-0015)
+
+Since v2.6 the playground's streaming transform runs in a `PgStream` Durable Object rather
+than in the Worker. That introduces a boundary the original model did not have, and the
+property that makes it safe is **inherited from the platform**, so it is worth stating
+explicitly rather than leaving implicit.
+
+| Threat | Analysis | Mitigation |
+|---|---|---|
+| **S**poofing | Something other than our Worker invokes `PgStream` with a forged job | **Not reachable.** A DO namespace has no URL and no route; the only way to obtain a stub is `env.PG_STREAM` inside this Worker. The `https://pg-stream.internal/chat` in `chat.ts` is a label for `wrangler tail`, not an address |
+| **T**ampering | Member alters the handoff envelope | The envelope is `<job JSON>\n<raw body>`. **Only the raw-body half is member-controlled**, and the DO re-validates it with the same `cleanChat()`. Channel, model, `userId`, `isAdm`, `demo` and `demoMaxTokens` are always taken from the job half — never from the re-parsed body, which is what makes dumb-mode's server-side override survive the hop |
+| **R**epudiation | — | `req_log` is written by the DO with the job's `userId`; `errlog` rows carry the same |
+| **I**nfo disclosure | `ch.api_key` now crosses a process boundary | It travels inside the Cloudflare runtime between two of our own compute instances; it is never in a response. The DO's `Response` is returned verbatim by the Worker, and its contents are the already-sanitized unified SSE — this is precisely what passthrough (ADR-0014) gave up and what ADR-0015 bought back |
+| **D**oS | Cost/quota bypass by going "straight to the DO" | Impossible for the same reason as spoofing. Quota and demo gating run in the Worker **before** the handoff, so there is no path that reaches upstream without passing them |
+| **E**levation | `job.isAdm` decides whether raw upstream errors are shown | It is a **privilege claim carried in a message body**, not a lookup. Sound today because the sender is trusted-by-construction; it is the assumption a second caller of `PG_STREAM` would silently break |
+
+**Two consequences for reviewers**, both of which are why this section exists:
+
+1. The playground's entire authorization surface is now in `routes/api/playground/chat.ts`.
+   `PgStream` re-derives nothing. A reviewer who reads the DO looking for checks will not
+   find them and should not conclude they are missing.
+2. Moving a check "down into the DO for symmetry" would move a trust boundary that nothing
+   in the code marks. Adding a second caller of the binding does the same.
+
+Availability note: the handoff is wrapped in try/catch and falls back to running the same
+`lib/pgchat.ts` in the Worker, writing an `errlog` row (`pg.do`). `settings.pg_do='0'`
+forces that path with no deploy. The fallback is a **degradation** (long replies hit the
+10 ms wall again), never a different behaviour.
 
 ### 2.8 D1 (single database)
 - All queries use bound parameters (no string-built SQL with user input; LIMIT/OFFSET are parseInt-validated).
@@ -167,6 +203,95 @@ is never user-controlled, so the worst case is reaching a different path *on an 
 the admin already authorized*. It becomes a real issue the moment a channel's `base_url`
 carries a path prefix (`https://host/api/v1`), because `..` could then climb out of that
 prefix. Tracked as DEBT #22; the fix is to reject segments equal to `.` or `..`.
+
+### 4.5 `visits` logging is an unmetered anonymous D1 write, on a budget it shares 1:1 with everything that matters
+
+Added 2026-08 ([review F1](./REVIEW-2026-08.md)). **✅ Fixed in v2.6.1** — kept here rather than
+deleted because the reasoning is what makes the fix legible, and because §2.8 was built on the
+assumption this section corrects. The fix is described at the end.
+
+`router.ts:107` calls `visitLog()` before dispatch, writing one `visits` row for any request
+carrying `Accept: text/html` — including paths that do not exist, which also defeats edge
+caching. There is no sampling and no rate limit. `/api/csp-report` — the *other* anonymous
+D1 write path, and the one this document's §2.8 reasoning was built around — has both, plus
+fail-closed behaviour, and its source comment claims to be the only such path.
+
+Why the asymmetry matters: the free tiers are **100,000 Worker requests/day** and
+**100,000 D1 rows written/day**. Visit logging consumes them one-for-one, so the site's
+least valuable write has first claim on the budget that also has to cover sessions, chat
+persistence and `req_log` (~4 rows per playground turn). On exhaustion, D1 returns errors
+for **all queries, not just writes** ([D1 pricing][d1p]).
+
+The failure is silent by construction: `errlog` is a D1 table, `tgAlertScan` reads `errlog`
+from D1, and `runJob` records outcomes into `settings` — also D1. **The alert channel
+depends on the subsystem whose failure it would have to report.** Fail-open is correct
+everywhere it appears here; the gap is that nothing reserves headroom, and nothing can say
+so afterwards.
+
+`cron.ts:274-278` names this risk exactly and says it is recorded in DEBT. It was not —
+DEBT #18 covers `visits` only as long-term table growth, a different time constant that the
+180-day retention already addresses.
+
+**Fix shipped in v2.6.1** — two layers, neither adding I/O to the user's critical path:
+
+- **L1, a page allowlist** (`_middleware.ts`). Only paths the site actually serves are logged.
+  The trigger used to be "carries `Accept: text/html`", which meant *any* path including ones
+  that do not exist; scanners hitting `/wp-admin`, `/.env`, `/phpmyadmin` each cost a row.
+  Zero-cost, and it removes the unbounded-cardinality case entirely.
+- **L2, a site-wide daily cap** (`VISIT_GUARD`, 40,000 rows = 40 % of the free-tier write
+  budget) counted in the existing `RateLimiter` DO under `visit:global`, consulted on a 1-in-20
+  sample with the verdict cached per isolate for the rest of the UTC day. Normal traffic
+  (~123 views/day) makes about six DO calls a day; a flood converges within a sampling interval
+  and then costs nothing at all. Denial **or** limiter failure both stop logging — the inverse
+  of `lib/quota.ts`'s fail-open, for the same reason `csp-report` is fail-closed: what is being
+  protected is the *paid-for* writes' budget, so the cheapest write yields.
+
+The part that matters most is not the cap but its **observability**: tripping it writes one
+`visits.cap` row to `errlog`, which the existing five-minute `tgAlertScan` pushes to Telegram —
+**while D1 is still healthy**, because the self-imposed cap sits 60 % below the platform limit.
+That is the answer to this section's core problem: the alert fires on the leading indicator,
+not on the failure that would have silenced the alert channel.
+
+Independently, `/api/health` now classifies its D1 error as `quota` vs `error` vs `unbound`
+(`db_error`). It needs no D1 *write* to answer, so it remains the one endpoint that can still
+report the state — and the two situations demand opposite responses (wait for UTC midnight or
+upgrade the plan, vs. check the platform status page).
+
+### 4.6 The client-side sanitizer permits `style` on model-generated HTML
+
+Added 2026-08 ([review F2](./REVIEW-2026-08.md)). Also open.
+
+Two sanitizers guard two content paths on opposite principles: `lib/sanitize.ts` (server,
+admin markdown) is a **whitelist** whose global attribute list is `class`/`title` only;
+`playgroundpage.ts:293-306` (client, model output) is a **blacklist** of nine elements plus
+`on*`. The `style` attribute passes the second one.
+
+Model output is attacker-influenceable — prompt injection through a pasted document, a
+quoted web page, or a compromised upstream — and lands in `md.innerHTML`. Combined with
+`style-src 'unsafe-inline'` (DEBT #9), a reply can paint a full-viewport fixed overlay
+**inside the genuine, logged-in origin**, e.g. a fake "session expired, sign in again" card
+whose link the sanitizer itself decorates with `target="_blank" rel="noopener noreferrer"`.
+No script runs, so CSP is not violated and §2.9's nonce control — which is the load-bearing
+one for *script* injection — does not apply to this.
+
+What makes it worth fixing rather than accepting: the hijacked page is the one where members
+legitimately expect Google sign-in prompts.
+
+**Fix**: strip `style` in the attribute loop (one line), and consider dropping `<svg>`/
+`<math>` to match the server-side `DROP_CONTENT`. A related latent issue — the blacklist's
+uppercase `tagName` comparison does not match SVG-namespace elements, so `<svg><script>`
+survives it (harmless today: `innerHTML` never executes scripts and CSP has no
+`unsafe-inline`) — is recorded as review F3.
+
+### Changelog
+
+| Added | Sections | Reason |
+|---|---|---|
+| 2026-07-22 | §4.1–4.4 | Round 2 of [AUDIT-2026-07](./AUDIT-2026-07.md) — accepted risks written out with reversal conditions |
+| 2026-08-06 | §1 sketch, §2.7c, §2.7 wording, §4.5–4.6 | v2.6 added a trust boundary (ADR-0015); [REVIEW-2026-08](./REVIEW-2026-08.md) found two open items |
+| 2026-08-06 | §4.5 marked fixed | v2.6.1 shipped the page allowlist, the daily visit cap and the `/api/health` D1 classification. §4.6 remains open |
+
+[d1p]: https://developers.cloudflare.com/d1/platform/pricing/
 
 ---
 
@@ -271,3 +396,66 @@ Cloudflare 預設之外無 WAF／bot 管理；VPN token 網址可能被偷看（
 「管理員已經授權的那個上游」的別條路徑。但只要有渠道的 `base_url` 帶了路徑前綴
 （`https://host/api/v1`），`..` 就能爬出那個前綴。記在 DEBT #22；修法是直接拒收
 等於 `.` 或 `..` 的片段。
+
+## v2.6 新增的信任邊界：Worker → Durable Object（§2.7c 中文版）
+
+v2.6 起 Playground 的串流轉譯跑在 `PgStream` Durable Object 裡（ADR-0015），這是原本的
+威脅模型沒有的一條邊界。**讓它安全的那個性質是繼承自平台的**，所以必須明講而不是留給人猜：
+
+**DO 命名空間沒有網址、沒有路由，唯一取得 stub 的方式是本 Worker 裡的 `env.PG_STREAM`。**
+`chat.ts` 裡那個 `https://pg-stream.internal/chat` 只是給 `wrangler tail` 認的標籤，不是位址。
+因此「繞過 Worker 直接打 DO」不存在，配額與體驗模式閘門都在交棒**之前**跑完。
+
+交棒信封是 `<job JSON>\n<原始本體>`，**只有後半是會員可控的**，而 DO 會用同一支 `cleanChat()`
+重新驗一次。渠道、模型、`userId`、`isAdm`、`demo`、`demoMaxTokens` **一律以 job 為準**，
+絕不取自重新解析的本體 —— 這正是 dumb mode 的伺服器端覆寫能撐過這一跳的原因。
+
+兩個給後續 reviewer 的提醒（這一節存在的理由）：
+① Playground 的授權面現在**完全**在 `routes/api/playground/chat.ts`，`PgStream` 一項都不重推導；
+去 DO 裡找檢查的人會找不到，但那不代表少做了。
+② 「為了對稱把檢查搬進 DO」會移動一條程式裡沒有標記的信任邊界；多一個 `PG_STREAM` 的呼叫端也一樣。
+另外 `job.isAdm` 決定會員看不看得到上游錯誤原文 —— 它是**在訊息本體裡旅行的權限主張**而不是一次查詢，
+今天成立是因為寄件人可信，而那正是第二個呼叫端會安靜打破的假設。
+
+可用性：交棒包在 try/catch 裡，叫不動就退回在 Worker 裡跑同一支 `lib/pgchat.ts` 並寫 `errlog`；
+`settings.pg_do='0'` 免部署強制走那條。退路是**降級**（長回覆會再撞 10ms）而不是另一種行為。
+
+## 明知且尚未修的風險（2026-08 第三輪稽核新增）
+
+上面四條是「想過之後決定不修」；下面兩條不同 —— **它們是還沒有負責人的活風險**，
+寫進來是為了不讓它們停在某個人的腦袋裡。全文見 [REVIEW-2026-08.md](./REVIEW-2026-08.md)。
+
+**⑤ ✅ v2.6.1 已修 — `visits` 是不計量的匿名 D1 寫入，而且跟所有有價值的寫入 1:1 共用同一個預算。**
+（原文保留：推理過程才是讓修法看得懂的東西，而 §2.8 當初正是建立在這一節所更正的假設上。）
+`router.ts:107` 在路由分派**之前**就呼叫 `visitLog()`，只要請求帶 `Accept: text/html`
+就寫一列 —— **連不存在的路徑都算**，而且每個路徑都不同，順便讓邊緣快取失效。
+沒有取樣、沒有限流。而 `/api/csp-report`（本文件 §2.8 的推理所圍繞的那個匿名寫入口）
+兩樣都有，還是 fail-closed，它的原始碼註解甚至聲稱自己是全站唯一。
+
+不對稱為什麼要緊：免費額度是 **Workers 每日 10 萬請求**與 **D1 每日 10 萬列寫入**，
+而瀏覽紀錄是一比一在吃它。也就是說**全站最沒價值的那筆寫入，對「同時要供養 session、
+對話落地、`req_log`（一輪聊天約 4 列）」的預算有優先權**。額度用完時，D1
+**連查詢都會回錯誤，不只寫入**。
+
+而那一刻站台講不出話：`errlog` 是 D1 的表、`tgAlertScan` 要從 D1 讀它、`runJob` 把結果寫回
+D1 的 settings。**告警管道依賴的正是那個它必須回報其故障的子系統。** fail-open 在這裡
+每一處都是對的，缺的是「沒有任何東西替有價值的寫入保留額度」，以及事後沒有任何東西說得出口。
+
+`cron.ts:274-278` 把這個風險寫得很精確，並說「記在 DEBT」——**但它沒有進 DEBT**：
+#18 只涵蓋 `visits` 的長期列數成長，那是不同的時間尺度，而且 180 天保留期已經處理掉了。
+修法由便宜到貴：不記沒命中的路徑 → 比照 csp-report 取樣 → 用既有 `RateLimiter` DO 的
+`visit` 命名空間（`RateCheckArg.svc` 本來就是為這種切分存在）替使用者資料保留多數額度 →
+`/api/health` 要能把「D1 寫入額度爆了」講出來，因為正常告警路徑證明講不出來。
+
+**⑥ 客戶端消毒器放行模型輸出裡的 `style` 屬性。**
+兩個消毒器守兩條路、原理相反：`lib/sanitize.ts`（伺服器、管理員 Markdown）是**白名單**，
+全域屬性只有 `class`／`title`；`playgroundpage.ts:293-306`（客戶端、模型輸出）是**黑名單**，
+只擋九個元素加 `on*` —— `style` 通過。模型輸出是可被影響的（貼進來的文件、被引用的網頁、
+被打下來的上游），最後進 `md.innerHTML`。配上 `style-src 'unsafe-inline'`（DEBT #9），
+一則回覆就能在**真正的登入中網域**上蓋一張滿版固定定位的假「登入逾時」卡，
+而那個連結還會被消毒器自己加上 `target="_blank" rel="noopener noreferrer"`。
+沒有 script 執行，所以 CSP 不會擋，§2.9 的 nonce 管制（那是擋**腳本**注入的承重牆）
+對這件事不適用。值得修而不是接受的理由：被劫持的正是「會員本來就預期看到 Google 登入提示」的那一頁。
+修法：屬性迴圈裡一併移除 `style`（一行），並考慮比照伺服器端把 `<svg>`／`<math>` 也丟掉。
+相關的潛伏問題（黑名單用大寫比對 `tagName`，對 SVG 命名空間不成立，`<svg><script>` 會活下來；
+今天無害，因為 `innerHTML` 插入的 script 不執行、CSP 也沒有 `unsafe-inline`）記在稽核 F3。

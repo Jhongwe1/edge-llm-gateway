@@ -84,10 +84,66 @@ if (!deploy) fail("docs/COMPARISON.md：找不到 Deploy 那一列");
 else if (!deploy[1].includes("wrangler deploy") || /pages/i.test(deploy[1]))
   fail(`docs/COMPARISON.md：Deploy 列還在講 pages deploy →${deploy[1].trim()}`);
 
+// 5) 程式常數 × 散文數字（2026-08 加，DEBT #37）
+//
+// 起因：稽核發現四句「程式已經推翻的敘述」，其中最典型的是圖片總量上限 ——
+// 兩份 README 與 ADR-0013 都還寫「1.5MB」，而 PG_LIMITS.maxImgBytesTotal 早就是 16MB。
+// 這類漂移不會讓任何測試變紅，只會讓讀者對整份文件失去信任。
+//
+// ⚠ 這裡立了一條**慣例**，而檢查是靠那條慣例成立的：
+//
+//     「在散文裡引述某個常數的值時，要把常數名一起寫出來。」
+//
+// 有了常數名當錨點，就能精準地只驗「這一段在講這個常數」的地方，不必去猜文件裡
+// 每一個「16MB」指的是不是它（那種寬鬆比對必然誤判，然後被人加白名單，然後失效）。
+// 反過來說：**沒有寫常數名的數字，這裡驗不到** —— 這是已知的涵蓋缺口，不是疏漏。
+// 想被保護就把常數名寫上去，這正是我們要的誘因方向。
+//
+// 只驗「活文件」。docs/adr/** 與 AUDIT／REVIEW 是**有日期的紀錄**，本來就該保留寫作當下
+// 的數字（ADR-0013 的 1.5MB 是對的 —— 它記錄的是 v2.4.0 那天的事實，另外用補記說明變更）。
+// 把歷史文件一起驗，就是在逼人竄改紀錄，那比數字過時更糟。
+const LIVING_DOCS = ["README.md", "README.zh-TW.md", "API.md", "AGENTS.md"];
+const pgSrc = read("src/lib/playground.ts");
+const constOf = (name) => {
+  const m = new RegExp(name + "\\s*:\\s*(\\d+)").exec(pgSrc);
+  return m ? parseInt(m[1], 10) : null;
+};
+// 值 → 文件裡應該出現的樣子。MB 類用十進位（16000000 → 16MB），允許中間有沒有空格。
+const asMb = (n) => new RegExp("\\b" + n / 1000000 + "\\s*MB\\b", "i");
+const CONSTS = [
+  { name: "maxImgBytesTotal", re: asMb, label: (n) => n / 1000000 + "MB" },
+  { name: "maxImgBytesCeiling", re: asMb, label: (n) => n / 1000000 + "MB" },
+  { name: "maxImgPerMsg", re: (n) => new RegExp("\\b" + n + "\\b"), label: (n) => String(n) }
+];
+for (const c of CONSTS) {
+  const val = constOf(c.name);
+  if (val === null) {
+    fail(`src/lib/playground.ts：抓不到常數 ${c.name}（PG_LIMITS 的形狀變了？）`);
+    continue;
+  }
+  const want = c.re(val);
+  for (const f of LIVING_DOCS) {
+    // 以「段落」為單位而不是「行」：Markdown 的一句話常常斷成好幾行，
+    // 常數名在第一行、數字在第三行是很正常的排版。
+    const paras = read(f).split(/\n\s*\n/);
+    for (const para of paras) {
+      if (para.indexOf(c.name) < 0) continue;
+      if (!want.test(para)) {
+        fail(
+          `${f}：有段落提到 ${c.name} 卻沒有寫出目前的值 ${c.label(val)} —— ` +
+            `程式改了、文件沒跟上（或引述時該把值一起寫出來）`
+        );
+      }
+    }
+  }
+}
+
 if (errs.length) {
   console.error("✗ 文件與現況對不上：\n");
   for (const e of errs) console.error("  · " + e);
   console.error("");
   process.exit(1);
 }
-console.log(`✓ 文件數字一致（測試 ${TESTS} 條、E2E ${E2E} 條、版本 v${VERSION}）`);
+console.log(
+  `✓ 文件數字一致（測試 ${TESTS} 條、E2E ${E2E} 條、版本 v${VERSION}、PG_LIMITS 常數 ${CONSTS.length} 項）`
+);

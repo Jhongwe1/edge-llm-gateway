@@ -35,10 +35,16 @@
 
 ## 連線與驗證
 
-- 正式站：`https://uaip.cc.cd`（等同 `https://uaip.pages.dev`）
-- 本機開發：`http://localhost:8787`（`npx wrangler dev`；**localhost 免金鑰**，想先試就在本機試）
+- 正式站：`https://uaip.cc.cd`（**Cloudflare Worker**。2026-07-16 起已從 Pages 割接過來，
+  舊的 `uaip.pages.dev` 已退役 —— 打得到也不是這個站，別拿它當備用網域）
+- 本機開發：`http://localhost:8787`（**用 `npm run dev`**，不要裸跑 `npx wrangler dev`）
 - 管理員 API（路徑含 `/admin` 的與 `/api/logs`）要帶標頭：`Authorization: Bearer <管理金鑰>`
 - **管理金鑰**：讀本機 `ADMIN.local.md`（gitignored；2026-07-14 起 ADMIN.md 不再放明文）
+- ⚠ **「本機免金鑰」已經不成立**（2026-07-22 改）：那道後門以前看的是 `Host` 標頭 ——
+  而 Host 是客戶端送的字串，等於拿使用者的輸入做授權判斷，而且設定缺失時往「開」的方向倒。
+  現在改看明示旗標 `DEV_UNSAFE_ADMIN=1`（只存在於 `.dev.vars`，`wrangler deploy` 永遠不會上傳）。
+  `npm run dev` 已經內建這個旗標；**裸跑 `wrangler dev` 就得自己先建 `.dev.vars`**，否則
+  本機的管理端點一樣回 401、測試登入表單也不會出現。
 
 ## 三條鐵則（違反會出事）
 
@@ -137,7 +143,10 @@ curl "https://uaip.cc.cd/api/logs?limit=50&since=2026-07-08T16:00:00Z" \
 
 v1.0.0 起本專案有工具鏈（`npm ci` 裝 vitest／wrangler／tsc；**執行期仍零依賴**）：
 
-- **改任何程式前先跑測試**摸清現狀：`npm test`（跑在 workerd 裡，真 D1）；`npm run checks`＝typecheck＋測試。
+- **改任何程式前先跑測試**摸清現狀：`npm test`（跑在 workerd 裡，真 D1、真 DO、真串流）。
+  推之前跑 `npm run checks`＝`lint`＋`typecheck`＋`test`＋`check:docs`。
+  ⚠ **`npm run checks` 不含 `format:check`**，但 CI 的 lint job 會跑 Prettier 漂移檢查 ——
+  只跑 checks 就推，很容易被排版擋在 CI。要嘛推之前補跑 `npm run format:check`，要嘛先 `npm run format`。
 - **schema 改動走 migration**：新增檔案 `migrations/000N_描述.sql`（**別再改** `migrations/0001_baseline.sql`；
   `db/schema.sql` 已退役刪除）。本機套用 `npm run migrate:local`、正式 `npm run migrate:remote`（純增量，
   先於部署）。測試會自動套 `migrations/` 全部，所以新表新欄記得補測試。
@@ -148,6 +157,66 @@ v1.0.0 起本專案有工具鏈（`npm ci` 裝 vitest／wrangler／tsc；**執�
 - **改了 `public/index.html` 的 inline script**：跑 `node tools/check-csp.mjs --print` 拿新 hash 更新
   `public/_headers`（CI 有 CSP 防漂移檢查，忘了會紅燈）。
 - 部署：`npm run deploy`（＝重建 apidoc＋openapi＋`wrangler deploy`；不能用後台拖曳上傳）。
-- 本機開發：`npm run migrate:local` 建表 →（選用）`npm run seed` 塞種子 → `npm run dev`（localhost 免金鑰）。
+- 本機開發：`npm run migrate:local` 建表 →（選用）`npm run seed` 塞種子 → `npm run dev`
+  （這支已帶 `DEV_UNSAFE_ADMIN=1`，管理端點才免金鑰）。
 - 更完整的架構論述見 [README.md](./README.md) 與 `docs/`（ADR、威脅模型、對照、報告骨架）；
   維護眉角（金鑰更換、備份、圖片快取地雷）見 [ADMIN.md](./ADMIN.md)；已知債務見 [DEBT.md](./DEBT.md)。
+
+---
+
+## 這個站現在長什麼樣（v2.2 → v2.6 補述，2026-08-06）
+
+上面那些流程從 2026-07 起沒有改變 —— **內容操作的 API 契約是穩定的**，照抄就對。
+這一節補的是「你會在旁邊看到、但上面沒提過」的東西，以免你把正常行為當成故障。
+
+### 聊天端點背後換了兩次架構，但**對外契約一次都沒變**
+
+`POST /api/playground/chat` 回的 SSE 事件（`{conv,title?}` → `{r}`／`{d}` → `{done}`）
+從 v2.3 到現在完全相同。中間發生過的事：
+
+| 版本 | 串流在哪裡跑 | 為什麼 |
+|---|---|---|
+| ~v2.4 | Worker | 原始做法；長回覆會撞免費方案 **10ms CPU**，isolate 被砍、瀏覽器看到無聲截斷 |
+| v2.5 | Worker（原生直通） | CPU 626ms→6ms，但**只活了一天**：直通等於把轉譯刪掉，連帶失去淨化、伺服器落地、背景續跑 |
+| **v2.6（現在）** | **`PgStream` Durable Object** | 轉譯原封不動搬進 DO（**30 秒 CPU，免費方案也一樣**）。Worker 只剩驗證與建檔（3ms），回應原樣轉出 |
+
+對你的實務影響只有兩點：
+
+- **`wrangler tail` 會看到兩筆調用**（Worker 一筆、DO 一筆），這是正常的，不是重複請求。
+- **改 `src/lib/pgchat.ts` 之後，熱的 DO 實例會沿用舊程式碼直到被回收**，所以部署完立刻測
+  可能還是舊行為。這是 DO 的固有性質（DEBT #34），不是部署失敗 —— 等一下再測。
+
+決策全文見 [ADR-0015](./docs/adr/0015-durable-object-streaming.md)。
+
+### 免部署的退場開關（出事時先按這些，不要急著 deploy）
+
+全部是 `PUT /api/admin/settings`，寫進 D1 立刻生效。**這是這個站最重要的維運資產**：
+所有「新架構」都保留了一鍵退回舊行為的路，而且兩條路跑的是同一份程式，所以退回是**降級**不是**變成另一種行為**。
+
+| 鍵 | 設成 `"0"` 的效果 | 代價 |
+|---|---|---|
+| `pg_do` | Playground 串流退回在 Worker 裡跑（＝v2.4 行為） | 長回覆會再撞 10ms CPU 上限 |
+| `quota_do` | 配額計數退回 D1 `COUNT`（＝v1 行為） | 併發下是近似值，會有極少量超賣 |
+| `relay_meter` | `/relay` 退回純直通、不計量 | `req_log` 不再有 relay 的 token／延遲 |
+| `demo_mode` | 關掉匿名體驗模式 | 未登入訪客不能試聊（**燒錢面直接關掉**，出事時先按這個） |
+| `dumb_mode` | 解除「把會員鎖在單一隱藏模型」 | — |
+
+### v2.3 起多出來的東西（操作內容時可能會遇到）
+
+- **附件**：`POST /api/playground/files`（本體是 **raw base64**，不是 JSON、不是二進位；
+  中繼資料走 query string）。只收 jpeg/png/webp/gif，且**宣告的 mime 必須與檔頭相符**。
+  儲存有兩種模式，看有沒有綁 R2；單檔上限 1400KB（純 D1）或 5MB（R2）。
+- **圖片張數問上游、不寫死**：`model_caps`（v2.4.1）。上游宣稱的數字**會騙人**，
+  所以站上另外記一份「撞 400 學回來的真值」，而且永遠勝過宣稱值。
+- **單次請求圖片總量預設 16MB**（`PG_LIMITS.maxImgBytesTotal`；天花板 32MB，可用設定鍵
+  `pg_img_total_kb` 往下調）。單則最多 10 張（`PG_LIMITS.maxImgPerMsg`）。
+  這條限的是 CPU 不是儲存 —— 跟 `pgfile_*` 那三層是兩回事。
+- **數學式渲染**（v2.3.3）：聊天訊息裡的 LaTeX 會用 KaTeX 按需渲染。
+
+### 三條鐵則之外，再記一條
+
+**發現文件跟程式對不上時，改文件、不要改程式去遷就文件。** 這個 repo 已經把幾類文件漂移接上 CI
+（測試數、E2E 數、版本號、對照表的架構列 —— 見 `tools/check-docs.mjs`），但**還沒接上的那些
+就是靠人**。2026-08 的稽核在四個地方抓到程式已經推翻的敘述，其中一句就在 `API.md` 裡
+（「中斷連線＝停止生成」，實際上斷線後會繼續跑 20 秒把話講完）。細節見
+[docs/REVIEW-2026-08.md](./docs/REVIEW-2026-08.md)。

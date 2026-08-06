@@ -128,23 +128,37 @@ audit-logged.
 ```mermaid
 flowchart LR
   V((visitors)) --> W
-  subgraph edge["Cloudflare edge (free tier, one Worker)"]
-    W["Worker · src/index.ts<br/>hand-written router, SSR shell,<br/>per-request CSP nonce"]
-    A[("static assets<br/>public/ · sha256 CSP")]
-    D[("D1 (SQLite)<br/>users · sessions · content ·<br/>req_log · errlog · audit · usage_daily")]
-    DO["RateLimiter DO<br/>atomic check-and-count<br/>u:&lt;member&gt; · demo-ip:&lt;ip&gt; · demo:global"]
-    CRON["cron ×2<br/>*/5 alert scan<br/>daily rollup+backup+purge"]
-    R2[("R2 (optional)<br/>attachments · daily JSONL<br/>backups ×14")]
+  subgraph edge["Cloudflare edge · free tier · ONE Worker (src/index.ts)"]
+    W["fetch() — hand-written router<br/>SSR shell · per-request CSP nonce<br/><b>10 ms CPU per invocation</b>"]
+    CRON["scheduled() — 2 cron triggers<br/>*/5 errlog scan<br/>daily rollup · backup · purge · R2 guard"]
+    A[("static assets · public/<br/>sha256 CSP · SPA fallback")]
+    D[("D1 · one SQLite database<br/>users · sessions · content · pg_*<br/>visits · req_log · errlog · audit · usage_daily")]
+    DO["RateLimiter DO — atomic check-and-count<br/>u:&lt;member&gt; · demo-ip:&lt;ip&gt; · demo:global<br/>csp-ip:&lt;ip&gt; · visit:global"]
+    PG["PgStream DO — <b>30 s CPU</b><br/>SSE transform · upstream sanitation<br/>persistence · finish-after-disconnect<br/>pg:u:&lt;member&gt;"]
+    R2[("R2 · optional<br/>attachments · daily JSONL<br/>backups ×14")]
     W --- A
     W --- D
     W --- DO
-    CRON --> W
-    W --> R2
+    W --- R2
+    W ==>|"handoff: job JSON + raw body<br/>Response returned verbatim"| PG
+    PG --- D
+    PG --- R2
+    CRON --- D
+    CRON --> R2
   end
-  W -->|"/relay pump"| U["any LLM upstream"]
-  W -->|"/vpn merge"| AP["VPN upstreams"]
+  PG ==>|"playground chat"| U["any LLM upstream"]
+  W -->|"/relay · metering pump"| U
+  W -->|"/vpn · multi-source merge"| AP["VPN upstreams"]
   CRON -.->|"errlog delta"| TG["Telegram alerts"]
 ```
+
+Reading it: **the thick edges are the v2.6 path.** The Worker spends ~3 ms authorising, validating
+and recording a chat request, hands the rest to `PgStream`, and returns that Response untouched —
+so the 626 ms transform runs where there is a 30 s budget instead of a 10 ms one. Remove the
+`PG_STREAM` binding (or set `settings.pg_do='0'`) and the identical code runs in the Worker again:
+both hosts call the same `lib/pgchat.ts`, so the fallback is a *degradation*, never different
+behaviour. `scheduled()` sits inside the same Worker box because it is the same Worker — a second
+entry point in `src/index.ts`, not a separate service.
 
 Design decisions are recorded as ADRs — the honest trade-offs, not just the wins:
 
@@ -166,13 +180,14 @@ Design decisions are recorded as ADRs — the honest trade-offs, not just the wi
 
 Also: [Production report with real numbers](./docs/REPORT.md) ·
 [Security audit, two rounds + the miss rate of the first](./docs/AUDIT-2026-07.md) ·
+[Third-round review — what that audit's own method missed](./docs/REVIEW-2026-08.md) ·
 [Threat model (STRIDE)](./docs/THREAT-MODEL.md) ·
 [Honest comparison vs one-api / LiteLLM / OpenRouter / AI Gateway](./docs/COMPARISON.md) ·
 [Known debt](./DEBT.md) · [Security policy](./SECURITY.md)
 
-## Engineering evidence (v2.6.0)
+## Engineering evidence (v2.6.1)
 
-- **552 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
+- **567 unit/integration tests running inside workerd** (`@cloudflare/vitest-pool-workers`) —
   the same runtime as production: real D1, real Durable Objects, real streams, real
   `crypto.subtle`. Upstreams are mocked with `fetchMock` so tests assert *what actually got
   forwarded* (header stripping, key swapping, byte-for-byte stream fidelity, forced
@@ -244,9 +259,13 @@ Three things worth knowing before you change any of these numbers:
   cron measures real usage (attachments + backups) and evicts oldest-first against what is
   actually left, and monthly Class A/B op budgets degrade gracefully — writes fall back to
   D1, reads fall back to the placeholder. Deletes are free in R2 and never counted.
-- **Storing 5 MB is not sending 5 MB.** `PG_LIMITS.maxImgBytesTotal` still caps images
-  sent upstream at 1.5 MB per request — a CPU limit (ADR-0011), not a storage one — so the
-  browser keeps compressing toward the model budget rather than the storage limit.
+- **Storing 5 MB is not sending 5 MB.** `PG_LIMITS.maxImgBytesTotal` caps the images sent
+  upstream *per request* on a separate budget from storage — assembling that body costs CPU
+  in proportion to total bytes (933 KB → 1.62 ms, 2.8 MB → 6.00 ms), and it is spent
+  *before* the stream starts. It was **1.5 MB** while that spend came out of the Worker's
+  10 ms; since v2.6 moved the assembly into the Durable Object it is **16 MB** by default
+  (ceiling 32 MB, tunable live via `pg_img_total_kb`) — deliberately wide, to collect a real
+  distribution in `req_log.img_bytes` before a final number is chosen.
 
 Full reasoning and the measurements behind it:
 [ADR-0013](./docs/adr/0013-r2-optional-attachments.md).
@@ -263,7 +282,7 @@ migrations/       D1 schema, the only source of truth
 test/             vitest-pool-workers suites (unit + integration)
 e2e/              Playwright flows (real browser × wrangler dev × mock upstream)
 tools/            bench-sse / loadtest / build-apidoc / build-openapi / check-csp / seeds
-docs/             ADRs, threat model, audit, comparison, production report, openapi.yaml
+docs/             ADRs, threat model, audits/reviews, comparison, production report, openapi.yaml
 API.md            narrative API reference (source of the live /api-docs page)
 AGENTS.md         operating guide for AI agents
 ADMIN.md          maintainer notes (secrets live in gitignored ADMIN.local.md)
@@ -277,7 +296,7 @@ cp .dev.vars.example .dev.vars   # local dev flags (never uploaded by wrangler d
 npm run migrate:local     # create local D1 from migrations/
 npm run seed              # optional: local admin/member/channel seed
 npm run dev               # http://localhost:8787
-npm run checks            # eslint + typecheck + tests
+npm run checks            # eslint + typecheck + tests + doc-drift check
 npm run e2e               # Playwright (spins up mock upstream + wrangler dev itself)
 npm run bench             # reproduce the ADR-0011 CPU numbers
 npm run loadtest          # 200 concurrent requests at the rate limiter DO
@@ -296,6 +315,70 @@ optional Telegram alerts — also configurable from the `/settings` admin page):
 see [API.md](./API.md) — served live at
 [`/api-docs`](https://uaip.cc.cd/api-docs) with an interactive OpenAPI reference,
 spec at [`/openapi.json`](https://uaip.cc.cd/openapi.json).
+
+## If you are evaluating this as work
+
+Skip the feature list. The features are ordinary; **the decision trail is the artifact.** Three
+things here are hard to fake, and each one is verifiable from this repository in a few minutes.
+
+### 1. A performance problem diagnosed against the platform, not against the code
+
+The free Workers plan gives 10 ms of CPU per invocation, and exceeding it kills the isolate with
+**no catchable error, no log row, nothing the application can see** — replies stopped mid-sentence
+and the system could not tell anyone why. Two rounds of micro-optimisation made the loop as cheap
+as it could be and **it was still 62× over budget**, because the real cost was JS touching the
+bytes at all, not how the loop was written. A production multi-arm measurement established that
+(including one arm — the obvious `new TransformStream()` implementation — that measured *worse
+than doing nothing* while looking correct in review, in tests, and in a local bench).
+
+The fix was not a faster transform. It was noticing that Durable Objects get **30 s of CPU on the
+same free plan**, and that the expensive work therefore needed **relocating, not deleting**.
+626 ms went from 6 260 % of budget to 2.2 %, with zero features given up.
+→ [ADR-0015](./docs/adr/0015-durable-object-streaming.md) · [numbers](./docs/REPORT.md)
+
+### 2. A shipped design reversed in a day, and kept in the repo as a record
+
+v2.5 took the obvious conclusion from that measurement — hand the upstream body straight to the
+browser — and shipped it. **It was withdrawn the next day.** Passthrough buys the CPU win by
+deleting the transform, and the transform was the only thing sanitising upstream identity, the
+only reason the server could persist a reply or read token usage, and the only reason generation
+survives a closed tab. The measurement was right; the conclusion drawn from it was wrong.
+
+[ADR-0014](./docs/adr/0014-native-passthrough-streaming.md) is still in the tree, labelled
+superseded, with its three hard-won runtime traps intact — because *why a correct measurement
+produced a wrong call* is the part worth keeping.
+
+### 3. Claims wired to CI, including the ones that caught the docs lying
+
+An audit found three contradicting test counts in one repo. Numbers that can be checked now fail
+the build: test count (read from the vitest run, not counted statically — the first version
+counted `it(` and silently under-reported loop-generated tests), E2E count, version strings across
+three files, CSP hashes, OpenAPI ↔ route-table equality, and — added after the August review —
+**constants quoted in prose must match the constants in code**.
+
+The security work is written the same way: [two audit rounds that report the first round's miss
+rate](./docs/AUDIT-2026-07.md), and a [third round](./docs/REVIEW-2026-08.md) whose headline
+finding is one **the second round's own method should have caught**. Known-but-unfixed weaknesses
+are published with reversal conditions rather than quietly omitted.
+
+### Ten minutes, in this order
+
+| # | Open | Why |
+|---|---|---|
+| 1 | [`docs/adr/0015`](./docs/adr/0015-durable-object-streaming.md) | The central engineering decision, with the measurement that forced it |
+| 2 | [`src/lib/pgchat.ts`](./src/lib/pgchat.ts) | The streaming engine — disconnect detection as a write-timeout circuit breaker, and why `waitUntil` behaves differently inside a Durable Object |
+| 3 | [`docs/REVIEW-2026-08.md`](./docs/REVIEW-2026-08.md) | How the codebase is reviewed, including what the previous review missed |
+| 4 | [`src/lib/sanitize.ts`](./src/lib/sanitize.ts) | Zero-dependency whitelist HTML sanitiser, ~230 lines, with the bypass classes it defends against named inline |
+| 5 | [`DEBT.md`](./DEBT.md) | Every shortcut, why it was taken, and the threshold that reverses it |
+
+### Scope and honesty
+
+One maintainer, one personal site, single-digit users. The traffic numbers in
+[docs/REPORT.md](./docs/REPORT.md) are small and labelled as such; synthetic load tests are
+kept in a separate section so they cannot be mistaken for production data. What is being
+offered here is not scale — it is that **every claim in this repository can be checked**, and
+the ones that could not be checked automatically have been the subject of three review rounds
+that each published what they missed.
 
 ## License
 

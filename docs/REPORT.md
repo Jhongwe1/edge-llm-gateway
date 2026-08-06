@@ -5,6 +5,10 @@
 > (`req_log` / `visits`; queries listed at the bottom for reproducibility).
 > **This is a personal site with a handful of users — the numbers are small and
 > reported honestly.** The point is the *measurement machinery*, not the scale.
+>
+> **Appended 2026-07-31 (v2.6.0):** a streaming-CPU section measured in production with
+> `wrangler tail`. It is appended rather than merged because the v2.0.0 numbers above are
+> still what they were — a report that silently rewrites itself is not a report.
 
 ## Window
 
@@ -115,6 +119,61 @@ the more interesting column — triggers **zero GC events** where the full parse
 several. That is ADR-0011's "allocation is billed twice" claim made visible: the fast path
 allocates one string instead of an object tree, so there is nothing to collect.
 
+## Streaming CPU in production (v2.6.0, measured 2026-07-31)
+
+Production data again, and the only measurement in this document that could not be obtained
+from D1: **exceeding the 10 ms CPU budget produces no application-visible evidence at all** —
+the isolate is killed, the browser sees a stream stop mid-sentence, and not even a `req_log`
+row survives. `wrangler tail --format json` is the only instrument that reports it.
+
+Method: same prompt, same model, same channel; arms spaced ~30 s apart so the free plan's
+elastic CPU allowance could not carry over between runs.
+
+### Where the cost actually is (the measurement that decided ADR-0014/0015)
+
+| arm | how the response body is delivered | chunks | wall | **CPU** |
+|---|---|---|---|---|
+| transform | JS reads + parses + writes batched events | ~3,000 | 20.3 s | **626 ms** |
+| `new TransformStream()` + `pipeTo` | JS-backed pipe | 3,683 | 23.9 s | **1,001 ms** |
+| `IdentityTransformStream` + `pipeTo` | native pipe | 3,068 | 20.8 s | **5 ms** |
+| `new Response(resp.body)` | native passthrough | 5,422 | 33.4 s | **4 ms** |
+
+The cost is **JS touching the bytes**, not how often we flush. Row 2 is the one worth
+keeping: the obvious implementation is *worse than doing nothing*, and it looks correct in
+review, in tests, and in the local bench.
+
+### After moving the transform into a Durable Object
+
+| invocation | CPU | budget | % of budget |
+|---|---|---|---|
+| Worker `POST /api/playground/chat` | **3 ms** | 10 ms | 30 % |
+| Durable Object `PgStream` | **663 ms** | 30,000 ms | **2.2 %** |
+
+Same work, relocated rather than removed: 6,260 % of budget → 2.2 % of budget, with
+sanitation, server-side persistence, token accounting and background continuation all still
+running ([ADR-0015](./adr/0015-durable-object-streaming.md)).
+
+### The number that replaced it as the binding constraint
+
+CPU is no longer the ceiling; **Durable Object duration billing** is. Free tier is
+13,000 GB-s/day and a DO holds 128 MB, so a 20-second stream costs 20 × 0.125 = 2.5 GB-s —
+roughly **5,200 streams/day**. Two things follow that did not apply to the CPU limit:
+
+- it is billed on **wall time**, so a slow model costs more than a fast one for identical
+  output — the constraint moved from *how much the model says* to *how long it takes*;
+- it is **not measured anywhere yet** (DEBT #33). `req_log.dur_ms` already contains
+  everything needed: `SELECT SUM(dur_ms)/1000.0*0.125 FROM req_log WHERE svc='pg' AND ts>=…`
+  is the estimate, and the threshold to start watching is a daily total near 8 hours.
+
+### Method note — why the local bench is not in this section
+
+`npm run bench` measures the parse path in isolation on a desktop and **under-reports by
+roughly 95×** against production: no HTTP/2 framing, no TLS, no socket, no shared CPU. It is
+kept because it is reproducible and directionally right (it proved the fast path is
+allocation-free), but every number above came from the edge. Conflating the two is how the
+pre-v2.5 conclusion "4.2 ms, plenty of headroom" survived for a week while production was
+spending 626 ms.
+
 ## Caveats (as promised by the skeleton)
 
 n=10 supports no statistical claim — the percentile table demonstrates the
@@ -149,3 +208,18 @@ n=10 不構成統計主張 — 展示的是「原始值→百分位→報告」�
 併發打限流器，恰好 30 個過、170 個 429 — ADR-0007 的原子性在真併發下成立，被擋的不吃額度。
 gateway overhead 扣掉上游延遲後 p50 36.5ms／p99 56.1ms，但那是 wrangler dev 的本機
 workerd，要當成「壞天氣的上限」而不是正式站延遲（正式站 TTFB p50 502ms 那張表才是現實）。
+
+2026-07-31 追加**串流 CPU** 一節（v2.6.0），是本文件唯一無法從 D1 取得的量測 ——
+因為**燒穿 10ms CPU 不會留下任何應用層可見的證據**：isolate 被砍、瀏覽器看到串流講到一半
+消失、連 `req_log` 都寫不進去，只有 `wrangler tail` 看得到。多臂對照（每臂間隔 30 秒，
+免費方案的彈性配額才不會汙染下一輪）結論是：**成本來自「JS 有沒有碰到那些位元組」，
+不是 flush 幾次** —— 而最直覺的寫法 `new TransformStream()`＋`pipeTo` 量到 1001ms，
+**比什麼都不改還糟**，且它在 code review、測試、本機 bench 三關都看起來是對的。
+搬進 Durable Object 之後：Worker 3ms／10ms、DO 663ms／30000ms，從預算的 6260% 變成 2.2%，
+而且淨化、伺服器落地、token 記帳、背景續跑一項都沒犧牲。
+**新的天花板換成 DO 的 GB-s 計費**（免費 13,000 GB-s/日 ≈ 5200 趟串流）：它按**牆鐘**計價，
+所以同樣的輸出，慢的模型比快的模型貴 —— 限制從「模型講多少」變成「模型講多久」，
+而這件事目前**沒有任何量測**（DEBT #33），雖然 `req_log.dur_ms` 早就夠算了。
+最後補一條方法論註記：`npm run bench` 是本機孤立量測，**比線上低估約 95 倍**（沒有 HTTP/2
+框架、沒有 TLS、沒有 socket），留著是因為可重現且方向正確，但上面每個數字都來自邊緣。
+把兩者混為一談，正是「4.2ms，還很寬裕」這個結論能撐一個星期、而線上其實在花 626ms 的原因。

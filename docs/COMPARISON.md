@@ -9,7 +9,7 @@
 
 | | **uaip /relay** | **one-api / new-api** | **LiteLLM** | **OpenRouter** | **Cloudflare AI Gateway** |
 |---|---|---|---|---|---|
-| Shape | 1 Worker + 1 D1 + 1 DO | Go server + MySQL/Redis | Python proxy + DB | Hosted SaaS | Managed edge in front of your keys |
+| Shape | 1 Worker + 1 D1 + two DO classes | Go server + MySQL/Redis | Python proxy + DB | Hosted SaaS | Managed edge in front of your keys |
 | Deploy | `wrangler deploy` | container + DB | container/pip + DB | nothing (it's hosted) | dashboard config |
 | Multi-provider | OpenAI/Anthropic/Gemini/OpenAI-compat | very broad | very broad (100+) | very broad | broad |
 | Key model | shared upstream keys | shared, with billing/tokens | BYOK or shared | their keys, you top up | your keys |
@@ -61,9 +61,10 @@
 - **Fully owned, fully readable.** Every line that runs in production is in this repo and
   reviewable in an afternoon. No hosted dependency can change pricing, deprecate an endpoint,
   or read the traffic.
-- **Honest engineering evidence.** 552 tests in the real runtime, a threat model, fifteen
-  ADRs, a two-round security audit that reports its own first-round miss rate, and this
-  comparison — the artifact is meant to be defensible, not just functional.
+- **Honest engineering evidence.** 567 tests in the real runtime, a threat model, fifteen
+  ADRs, a security review across three rounds that reports its own miss rate — the third
+  round's headline finding is one the second round's own method should have caught — and
+  this comparison. The artifact is meant to be defensible, not just functional.
 
 ## Honest verdict
 
@@ -79,8 +80,8 @@ don't.
 **中文摘要**：這不是「我們贏」的表。one-api／LiteLLM／OpenRouter／AI Gateway 都成熟、
 多人維護，解的是 uaip 刻意不解的問題（BYOK、路由容錯、真實計費、上百家供應商廣度）。
 uaip 的架構換到的是：零伺服器零依賴、一顆 D1 一個心智模型、中轉與門戶／會員／配額／
-稽核一體、全碼自持可審、可論述的工程證據（552 條測試＋威脅模型＋15 份 ADR＋
-會自報漏檢率的兩輪稽核）。**計價只做報表、不做執法**：配額算的仍是「次數」，
+稽核一體、全碼自持可審、可論述的工程證據（567 條測試＋威脅模型＋15 份 ADR＋
+會自報漏檢率的三輪稽核 —— 第三輪的頭號發現，正是第二輪自己的方法本該抓到的）。**計價只做報表、不做執法**：配額算的仍是「次數」，
 所以同一個額度下用貴模型就是燒比較多錢 —— 那是刻意的取捨，不是漏做。
 需要路由／容錯／計費／百家供應商 → 用 LiteLLM 或 one-api；uaip 的定位是「一個人想在
 自己完全掌握的免費邊緣基建上，給少數信任的人閘門化的 LLM＋VPN＋網站」。

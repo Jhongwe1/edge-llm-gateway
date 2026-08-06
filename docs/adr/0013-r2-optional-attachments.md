@@ -109,6 +109,18 @@ bucket.
 the binding constraint on what the model can actually see), or article media (still D1
 BLOBs, ADR-0002 / DEBT #1) approaches 1 GB and wants the same treatment.
 
+> **Addendum, 2026-08-06 — the "Not solved by this" paragraph above is now out of date.**
+> It is kept verbatim because it was correct when written and its *reasoning* still holds;
+> only its number moved. `maxImgBytesTotal` was raised to **16 MB** (ceiling 32 MB, live-tunable
+> via `pg_img_total_kb`) in two steps: the owner widened it on 2026-07-29 to collect a real
+> distribution in `req_log.img_bytes`, and v2.6 removed the constraint that set it in the
+> first place — assembling the upstream body now happens inside a Durable Object with a 30 s
+> CPU budget, not in the Worker's 10 ms ([ADR-0015](0015-durable-object-streaming.md)).
+> So the sentence "lifting that needs a paid plan, not a bigger bucket" was wrong about the
+> *only* available lever, which is the more interesting error: the paid plan was one way to
+> buy 30 s of CPU, and it turned out not to be the only one.
+> Found by [REVIEW-2026-08](../REVIEW-2026-08.md) F4a.
+
 ---
 
 **中文摘要**：R2 是**可選**的 —— `FILES` 綁定在就寫 R2（單檔 5MB），拿掉就寫 D1（1400KB），
@@ -119,3 +131,10 @@ BLOBs, ADR-0002 / DEBT #1) approaches 1 GB and wants the same treatment.
 10.9GB 而毫無錯誤訊息。放寬到 5MB 同時必須換掉回讀的解碼方式（`atob`＋迴圈 5MB 要 11.31ms，
 超過免費方案 10ms CPU；改用原生 `Uint8Array.fromBase64` 只要 2.96ms）——上限與解碼成本是同一個決定。
 最後：**存得下 5MB 不等於模型看得到 5MB**，單次請求送上游的圖片總量仍受 CPU 限制在 1.5MB。
+
+> **2026-08-06 補記**：上面那句的**數字**已經過時（現在預設 16MB、天花板 32MB），
+> 但**道理沒過時** —— 那條線限的仍然是 CPU 而不是儲存。原文保留不改，因為寫的當下是對的。
+> 會變是因為 v2.6 把「組上游 body」整段搬進了 30 秒 CPU 的 Durable Object（ADR-0015），
+> 那筆花費不再從 Worker 的 10ms 出。順帶一提，原文英文版寫「要放寬只能升付費方案，
+> 不是換更大的桶子」—— **那句話錯的地方比數字有意思**：付費方案只是買到 30 秒 CPU 的
+> 其中一條路，結果它不是唯一一條。

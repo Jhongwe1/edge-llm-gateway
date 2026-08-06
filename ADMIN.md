@@ -74,10 +74,27 @@ wrangler.toml 已寫好 worker 名（uaip）、進入點（src/index.ts）與靜
 
 ## 訪客紀錄
 
-- 中介層 `src/routes/_middleware.ts` 只記「頁面瀏覽」（/、/ip、/ua），
-  不記 /api 與 /logs；瀏覽器 prefetch 也會跳過。寫入在背景執行、失敗不影響網站。
+- 中介層 `src/routes/_middleware.ts` 記「頁面瀏覽」，由 `router.ts` 在**路由分派之前**呼叫。
+  不記 /api、/logs、/admin、/img、/auth、/relay、/vpn/sub；瀏覽器 prefetch 也會跳過。
+  寫入在背景執行、失敗不影響網站。
+  ⚠ 但**判斷條件比想像中寬**：只要請求帶 `Accept: text/html` 就記，**連不存在的路徑都算**
+  （會落在 SPA fallback，回 200）。所以 `visits` 裡看到一堆沒見過的路徑不是 bug，是掃描器。
 - 資料庫：D1 `ipua-logs`（ID 75e2b765-66fd-4946-99c4-4524b4149ce0，綁定名 `DB`）。
-- 免費額度：每天 10 萬次寫入、500 萬次讀取、5 GB 容量 — 個人站用不完。
+- 免費額度：每天 10 萬次寫入、500 萬次讀取、5 GB 容量。
+- 🔴 **「個人站用不完」這句要打個星號**（2026-08 稽核，DEBT #35）：Workers 的免費額度也是
+  **每天 10 萬請求**，而瀏覽紀錄是**一個請求寫一列** —— 兩個數字一樣大，等於全站最沒價值的
+  那筆寫入跟 session、對話落地、`req_log`（一輪聊天約 4 列）搶同一個預算，而且優先權在前面。
+  被爬蟲密集掃的那天有機會用完，而**額度爆掉時 D1 連查詢都會失敗，不只寫入**。
+  更麻煩的是那時**告警講不出話**：`errlog` 是 D1 的表、Telegram 告警要從 D1 讀它。
+  症狀會是「網頁打得開，但登入失敗、聊天存不進去，而且沒有任何通知」。
+  - **懷疑時怎麼查**：Cloudflare Dashboard → D1 → ipua-logs 看當日 rows written；
+    或 `SELECT COUNT(*) FROM visits WHERE ts >= date('now')`（爆掉時這句本身也會失敗 —— 那就是答案）。
+  - **當下能做什麼**：等 UTC 午夜重置，或升 Workers Paid（幾分鐘生效）。
+  - ✅ **v2.6.1 已經上了兩道護欄**（DEBT #35）：① 只記白名單上的頁面路徑（掃描器打
+    `/wp-admin`、`/.env` 這些不再寫任何一列）② 全站每日 40000 列上限，跳掉時**寫一筆
+    `visits.cap` 進 errlog**，五分鐘後 Telegram 就會通知你 —— 而那個時候 D1 還活著。
+    看到那則通知代表「今天瀏覽紀錄停了，但站台一切正常」，不必緊張，隔天自動恢復。
+  - 保留期限（180 天）解決的是長期成長，跟上面兩道護欄是不同的東西，兩者都要有。
 
 ### 三個看紀錄的地方
 1. **https://uaip.cc.cd/logs** — 自建管理頁（要管理金鑰），可搜尋、看統計、點列展開細節。
@@ -96,7 +113,9 @@ wrangler.toml 已寫好 worker 名（uaip）、進入點（src/index.ts）與靜
   printf '<新金鑰>' | npx wrangler secret put LOGS_TOKEN
   ```
   換完記得：① 新值先寫進 ADMIN.local.md　② 瀏覽器 /logs、/admin 頁重新輸入一次（localStorage 存的是舊的）。
-- 金鑰沒設定時，正式站的紀錄 API 一律回 401（鎖死），本機開發（localhost）免金鑰。
+- 金鑰沒設定時，正式站的紀錄 API 一律回 401（鎖死）。本機要免金鑰得開明示旗標
+  `DEV_UNSAFE_ADMIN=1`（`.dev.vars` 裡；`npm run dev` 已內建）—— **不再是「看到 localhost 就放行」**
+  （2026-07-22 改：Host 標頭是客戶端可控的，拿它做授權判斷等於設定一缺就往「開」的方向倒）。
 
 ### 維護 SQL（想清舊資料時）
 ```
@@ -128,7 +147,9 @@ DELETE FROM visits WHERE ts < datetime('now', '-180 days');
 - RSS：`/feed`；sitemap：`/sitemap`（robots.txt 已指路）。
 - 站名目前暫用網址 `uaip.cc.cd` — 想好名字後在右上角 ✎ →「⚙️ 網站名稱」直接改（免部署、立即生效）。
 - 已知小事：cc.cd 的代理層會把 404 狀態改成 200（內容仍是「找不到內容」頁，且該頁 noindex，
-  對 SEO 無實際影響；直連 uaip.pages.dev 是正常 404）。
+  對 SEO 無實際影響）。⚠ 這條原本寫著「直連 uaip.pages.dev 是正常 404」可以拿來對照 ——
+  **那個網域已隨 2026-07-16 的 Pages→Workers 遷移退役**（ADR-0006），現在沒有第二個入口可以驗，
+  要看真實狀態碼只能用 `curl -I` 直接打 Worker 或看 `wrangler tail`。
 
 ## 編輯模式（✎）— 2026-07-09 上線，v2.2 改版
 
@@ -304,6 +325,44 @@ npx wrangler r2 bucket create uaip-files
 
 查用量：`npx wrangler r2 bucket info uaip-files`（或 Dashboard → R2）。
 
+### Durable Objects 運維（v2.6.0，2026-07-31）
+
+站上有**兩類** DO，用途完全不同，別搞混：
+
+| 類別 | 實例命名 | 做什麼 | 存狀態嗎 |
+|---|---|---|---|
+| `RateLimiter` | `u:<會員id>`、`demo-ip:<IP>`、`demo:global`、`csp-ip:<IP>` | 原子的「檢查並計數」（配額／限流） | 會（SQLite，每顆 3～4 列） |
+| `PgStream` | `pg:u:<會員id>` | Playground 串流轉譯 | **不會** —— 它只是「一個有 CPU 預算的執行場所」 |
+
+`PgStream` 存在的唯一理由：**免費方案的 Worker 每次呼叫只有 10ms CPU，而把上游 SSE
+讀進 JS 轉譯一趟要 626ms**。DO 的 CPU 上限是 **30 秒，免費方案也一樣**（那條 10ms 只綁 Worker）。
+
+**出事時先按這個**（免部署、寫進 D1 立刻生效）：
+
+```bash
+# 串流退回在 Worker 裡跑（＝v2.4 行為；長回覆會再撞 10ms，但站台不會掛）
+curl -X PUT https://uaip.cc.cd/api/admin/settings \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"pg_do":false}'
+# 恢復
+  -d '{"pg_do":true}'
+```
+
+**三件要知道的事**：
+
+1. **30 秒是 CPU 時間，不是牆鐘時間。** 模型思考 90 秒才吐第一個字＝**零成本**（那是等 I/O）。
+   真正花 CPU 的只有吐出來的字數（實測每個 chunk 約 0.2ms），要燒滿得約 15 萬個 chunk。
+2. **新的天花板是 GB-s 計費，而且沒有量測**（DEBT #33）：免費 13,000 GB-s/日，一顆 DO 128MB，
+   一趟 20 秒串流吃 2.5 GB-s ≈ **每日 5200 趟**。它按**牆鐘**算 —— 慢的模型比快的模型貴。
+   想估算：`SELECT SUM(dur_ms)/1000.0*0.125 FROM req_log WHERE svc='pg' AND ts>=date('now')`，
+   單日破 8 小時（≈額度一半）就該正視。
+3. **改完 `lib/pgchat.ts` 部署後，熱的 DO 實例會沿用舊程式碼直到被回收**（DEBT #34）。
+   部署完立刻測到舊行為**不是部署失敗**，等一下再測。`wrangler tail` 會看到 Worker 與 DO
+   各一筆調用，那也是正常的。
+
+**不要**去改 `wrangler.toml` 裡 `[[migrations]]` 已經部署過的 tag（`v1`／`v2`）——
+動了 wrangler 會直接擋下來。要加第三類 DO 就新增 `tag = "v3"`。
+
 ## 本機測試
 
 ```
@@ -311,9 +370,11 @@ npm ci                  # 第一次裝工具鏈（vitest/wrangler/tsc；執行�
 npm run migrate:local   # 建本機表（套用 migrations/ 全部；db/schema.sql 已退役）
 npm run seed            # （選用）塞管理員＋會員＋示範渠道
 npm run dev             # http://localhost:8787
-npm run checks          # 改程式後：typecheck＋全部測試
+npm run checks          # 改程式後：lint＋typecheck＋測試＋文件防漂移
+npm run format:check    # ⚠ checks 沒包這個，但 CI 會跑 — 漏了會被擋在 CI
 ```
-本機（localhost）後台與 API 免金鑰，方便試寫；本機資料庫與正式站完全分開，隨便玩不影響線上。
+本機後台與 API 要有 `DEV_UNSAFE_ADMIN=1` 才免金鑰（`npm run dev` 已內建；裸跑 `wrangler dev`
+要自己先 `cp .dev.vars.example .dev.vars`）。本機資料庫與正式站完全分開，隨便玩不影響線上。
 
 ## 主題（日夜）與語言
 
@@ -393,16 +454,17 @@ printf '你的CLIENT_ID' | npx wrangler secret put GOOGLE_CLIENT_ID
 printf '你的CLIENT_SECRET' | npx wrangler secret put GOOGLE_CLIENT_SECRET
 # Workers secret 設定後立即生效，不用重新部署。
 ```
-沒設 GOOGLE_CLIENT_ID 時：正式站 /auth/login 顯示「尚未開通」；本機（localhost）會改用「輸入信箱就登入」的測試表單，不需 Google 憑證也能開發測試。
+沒設 GOOGLE_CLIENT_ID 時：正式站 /auth/login 顯示「尚未開通」；本機**在 `DEV_UNSAFE_ADMIN=1` 之下**會改用「輸入信箱就登入」的測試表單，不需 Google 憑證也能開發測試（沒有那個旗標就只會看到「尚未開通」）。
 
 ### 申請 Google OAuth 憑證（一次性，約 5 分鐘）
 1. 開 <https://console.cloud.google.com/> → 建一個專案（例 uaip）。
 2. 左側「APIs & Services」→「OAuth consent screen」：User Type 選 **External**、填 App 名稱與你的信箱、Scopes 只要 `email`/`profile`/`openid`；發佈狀態 Testing 就夠（要用的人先加進 Test users，或按 Publish 讓任何人都能登入）。
 3.「Credentials」→ Create Credentials →「OAuth client ID」→ Application type **Web application**。
-4. **Authorized redirect URIs** 填這兩個（一定要完全一致）：
+4. **Authorized redirect URIs** 填這一個（一定要完全一致）：
    - `https://uaip.cc.cd/auth/callback`
-   - `https://uaip.pages.dev/auth/callback`（備用網域，可省）
-   - 本機測試不用登記（localhost 走測試表單）。
+   - ~~`https://uaip.pages.dev/auth/callback`（備用網域）~~ —— **2026-07-16 Pages→Workers 遷移後已退役**
+     （ADR-0006），現在填了也沒用；Google Cloud 後台若還留著這一條可以刪掉。
+   - 本機測試不用登記（走 `DEV_UNSAFE_ADMIN` 的測試表單，不經過 Google）。
 5. 建好後把 **Client ID** 與 **Client secret** 用上面的指令設進 Cloudflare。
 - 之後要多開放誰：把對方信箱加進 OAuth consent screen 的 Test users（或已 Publish 就不用）；要升成管理員就在 /members 頁按「設為管理員」，或把信箱加進 ADMIN_EMAILS。
 

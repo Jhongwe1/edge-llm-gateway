@@ -21,9 +21,9 @@
 
 1. **公開**：免驗證（whoami、已發佈內容、選單、站名）。
 2. **管理員**：路徑含 `/admin` 的、以及 `/api/logs`。兩種通過方式（擇一）：
-   - 請求標頭 `Authorization: Bearer <管理金鑰>`（curl／排程／AI agent 用）。管理金鑰＝Cloudflare Workers secret **LOGS_TOKEN**，跟 /logs、/admin 網頁登入同一把；值記在 ADMIN.md（不會上網）。
+   - 請求標頭 `Authorization: Bearer <管理金鑰>`（curl／排程／AI agent 用）。管理金鑰＝Cloudflare Workers secret **LOGS_TOKEN**，跟 /logs、/admin 網頁登入同一把；明文值只在 gitignored 的 `ADMIN.local.md`（2026-07-14 起 ADMIN.md 不再放明文）。
    - 管理員 Google 帳號的登入 cookie（瀏覽器用）：管理員信箱登入後，管理頁與管理員 API 免金鑰。管理員信箱＝環境變數 **ADMIN_EMAILS**（逗號分隔，例 `admin@example.com`；沒設定＝沒有信箱直升管理員，只認資料庫 users.is_admin）。
-   - **本機開發（localhost）免金鑰**；正式站沒帶或帶錯一律回 401。用 cookie 身分時，跨網站送出的請求會被 Origin 檢查擋掉（防 CSRF）。
+   - **本機開發要開明示旗標才免金鑰**（2026-07-22 改）：`.dev.vars` 裡的 `DEV_UNSAFE_ADMIN=1`，`npm run dev` 已內建。以前這道閘看的是 `Host` 標頭 —— 那是客戶端可控的字串，等於拿使用者的輸入做授權判斷，而且設定缺失時會往「開」的方向倒。正式站讀不到這個變數＝永遠 fail-closed。沒帶或帶錯金鑰一律回 401。用 cookie 身分時，跨網站送出的請求會被 Origin 檢查擋掉（防 CSRF）。
    - 換金鑰：`printf '新金鑰' | npx wrangler secret put LOGS_TOKEN`，設定後立即生效（Workers secret 不需重新部署）。
 3. **會員**：任何人用 Google 登入即為會員（見 `/auth/login`）。會員功能（API 中轉、VPN 訂閱）要**管理員核准**（status=approved）後才生效。
    - 網頁操作靠登入 cookie；**API 中轉**另用會員自己的金鑰 `uak-…`（在 /relay 頁產生，帶法同各家 AI API）。
@@ -307,7 +307,7 @@ curl -X PUT https://uaip.cc.cd/api/admin/menu ^
 | `dumb_model` | Dumb mode 鎖定的模型名（要在該渠道的模型清單裡；空字串＝刪鍵） |
 | `pgfile_max_kb` | **Playground 附件單檔上限**（KB，正整數；`null`＝回到該模式的內建預設）。上限與預設跟著儲存模式走 — 純 D1 預設 1400／最多 1464，R2 預設 5120／最多 10240。超過天花板回 400 並附 `ceiling` |
 | `pgfile_user_mb` | 附件的**每人**總量上限（MB）；純 D1 預設 30／最多 300，R2 預設 200／最多 2048 |
-| `pg_img_total_kb` | **單次請求所有圖片的 bytes 合計上限**（KB，正整數；`null`＝回到內建預設 16MB，天花板 32MB）。這條限的是**免費方案每請求 10ms CPU**（組上游 body 的成本跟圖片總 bytes 成正比），不是儲存空間 —— 跟 `pgfile_*` 三層是兩回事。2026-07-29 從 1.5MB 放寬到 16MB 以蒐集真實數據（見 `req_log.img_bytes`／`build_ms`），之後會依數據回頭定值 |
+| `pg_img_total_kb` | **單次請求所有圖片的 bytes 合計上限**（KB，正整數；`null`＝回到程式內建的 `PG_LIMITS.maxImgBytesTotal`＝16MB，天花板 `PG_LIMITS.maxImgBytesCeiling`＝32MB）。這條限的是**組上游 body 的 CPU**（成本跟圖片總 bytes 成正比），不是儲存空間 —— 跟 `pgfile_*` 三層是兩回事。2026-07-29 從 1.5MB 放寬以蒐集真實數據（見 `req_log.img_bytes`），v2.6 把這筆花費搬進 30 秒 CPU 的 DO 之後更沒有壓力，之後會依數據回頭定值 |
 | `pgfile_total_mb` | 附件的**全站**總量上限（MB，比對的是原始檔大小）；純 D1 預設 300／最多 400，R2 預設 6144／最多 6144（＝R2 裡的 8GB）。超過由每日 cron 從最舊的開始清內容 |
 | `vpn_public` | `true`／`false` — **VPN 對外展示**（2026-07-22 v2.2）：開啟後側邊欄選單與 /vpn 頁對**所有訪客**可見（未批准者看到登入／等待批准閘門；訂閱本身仍要逐人批准 vpn 服務）。`false`（預設）＝維持 VPN 隱形：選單不渲染、/vpn 裝成不存在。網頁在 /settings 的「VPN」卡 |
 
@@ -486,6 +486,13 @@ Authorization: Bearer uak-你的金鑰
 
 會員在網頁上直接試用中轉渠道裡的模型（2026-07-13 上線）。可選的模型＝各中轉管道的 `models` 清單；
 上游金鑰全程留在伺服器，會員只帶登入 cookie。對話存 D1、綁帳號、跨裝置同步。
+
+> **底下換過兩次架構，這一節的契約一次都沒變。** 串流從 Worker（~v2.4）→ 原生直通（v2.5，只活一天）
+> → **`PgStream` Durable Object（v2.6，現行）**。搬家的理由是免費方案 Worker 每次呼叫只有 10ms CPU，
+> 而把上游 SSE 讀進 JS 轉譯一趟要 626ms；DO 的 CPU 上限是 30 秒（免費方案也一樣）。
+> 對 API 使用者的意義是：**下面描述的事件形狀、錯誤形狀、淨化規則、落地行為都不受影響**，
+> 而且 `settings.pg_do='0'` 可以免部署退回在 Worker 裡跑（同一份程式，只是又會撞 10ms 上限）。
+> 決策全文見 [ADR-0015](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/docs/adr/0015-durable-object-streaming.md)。
 驗證：登入 cookie（要有 `playground` 服務，**或**管理員開了 `pg_open` 全員開放，見 §5）**或** `Authorization: Bearer <管理金鑰>`（以管理員帳號的身分操作，方便 curl／agent 測試）。
 
 **體驗模式（2026-07-17 v2.0.0，ADR-0009）**：管理員開 `demo_mode`＋設 `demo_channel` 後，**完全未登入**的訪客也能打 `GET /api/playground/models`（只回 demo 那一組、渠道顯示名固定「體驗模式」）與 `POST /api/playground/chat`（SSE 第一筆事件是 `{conv,title?,demo:true}` — `demo:true` 是給前端的旗標「別去動對話列表」，`conv` 照給，前端靠它把同一頁的後續訊息串成同一則）。限制：渠道與模型鎖白名單、輸入整包 4000 字、`demo_max_tokens` 有填才壓回覆長度；**對話會存進資料庫**（2026-07-21 起）但掛在 `demo:public` 名下、**只有管理員的 `/api/admin/conversations` 看得到**，訪客沒有任何讀取管道；fail-closed 限流（每 IP 分鐘/日＋全站日；超額 429 `demo-rate-limited`／`demo-quota-exceeded`，限流器故障 503 `demo-unavailable`）。**日額度用完的兩種 429 會附 `contact_url`**（管理員有設的話；文案不提 IP，`hint` 尾端也接同一條網址）— 跟會員配額同一套，見 §6 的 `contact_url`；每分鐘那條不附（等一下就好）。
@@ -512,7 +519,9 @@ Authorization: Bearer uak-你的金鑰
   - **`{r:…}` 是推理模型的思考過程**（2026-07-21）：GLM／DeepSeek 系的 `reasoning_content`、OpenRouter 的 `reasoning`、anthropic 的 `thinking_delta`、gemini 標了 `thought` 的 part，一律轉成 `r` 事件。思考內容**不寫進 `pg_messages`**（存的只有正式回覆），重新載入舊對話時不會再出現。非推理模型完全不會有 `r` 事件。
     > 這個欄位以前被丟掉，導致推理模型在思考期間瀏覽器收不到任何東西 — 畫面空白數十秒像當機，模型若把輸出預算全花在思考上更是「沒回覆、沒報錯」就結束。
   - **整趟沒有任何正式內容**（`d` 一次都沒來）→ 回 `{error:"empty-output", hint}`，不會靜默送 `done`。有收過思考的話 `hint` 會說明是「只輸出思考過程」。此錯誤不含上游身分，**會員看得到全文**。
-  - 中斷連線（前端按「停止」）＝停止生成，已生成的內容照樣存進對話。
+  - **中斷連線（關網頁／按「停止」）不會馬上停止生成**（2026-07-21 起，[ADR-0012](https://github.com/Jhongwe1/edge-llm-gateway/blob/main/docs/adr/0012-finish-reply-after-disconnect.md)）。伺服器判定對面離線後**繼續讀上游最多 20 秒**把回覆跑完再存，期間每 3 秒把已生成內容存檔一次。所以關掉網頁再回來，看到的通常是**完整**的回覆，而不是斷點那一截 —— 這是刻意的：舊行為是模型還在思考時關網頁，D1 連 assistant 那一列都不會有。
+    > 兩個要知道的細節：① 斷線偵測靠的是**寫入逾時**（5 秒），因為客戶端離線時 Cloudflare 不會取消回應串流，`writer.write()` 會永遠不 settle；② 伺服器**分不出**「關網頁」與「按停止」（兩者在伺服器端都只是 fetch 被中止），所以按停止之後上游仍會跑完那 20 秒的預算（DEBT #15）。
+  - 這 20 秒預算以前另有一層 30 秒硬上限（Worker 的 `waitUntil`）。v2.6 把生成搬進 Durable Object 之後那層天花板消失了，但**預算數字刻意沒動** —— 放寬會多花 DO 的計費時間，值得單獨決定。
   - 伺服器依渠道 kind 自動轉換請求／串流格式：openai、custom → `/v1/chat/completions`；anthropic → `/v1/messages`；gemini → `/v1beta/models/{model}:streamGenerateContent?alt=sse`。
   - **錯誤訊息對會員做了消毒**（2026-07-14）：上游的原始錯誤內容（錯誤格式、文件連結、專案編號）會洩漏真實提供商身分，所以會員只看得到安全分類字（401/403→「渠道憑證可能失效」、429→「上游流量限制」、5xx→「上游暫時故障」…），`detail` 原文**只有管理員**（is_admin 或管理金鑰）看得到。
 
@@ -560,7 +569,7 @@ Authorization: Bearer uak-你的金鑰
   - 模型必須看得懂圖片（上游回報的能力優先，其次是管理員標的 `vision_models`），否則回 400 `no-vision`（**檢查在建立對話之前** — 不留下「訊息存了但圖沒送到」的半吊子狀態）。
   - **張數超過該模型的上限時，多的圖會從最舊的開始降級成文字佔位**（跟總 bytes 超標的處理一樣，內容裡補一行 `[已省略的圖片：檔名]`），不是回錯誤 —— 上限本身見 `model_caps`。
   - 若上游仍以「圖片張數過多」回絕（宣稱值不準時會發生），回 **400 `too-many-images`**，`hint` 直接告訴會員這個模型一次看得懂幾張；同時把真實上限學進 `model_caps.seen`，**下一次送出前就會先砍好，不會再撞第二次**。
-  - 單則最多 10 張；**單次請求所有圖片的原始大小合計上限預設 16MB**（2026-07-29 從 1.5MB 放寬，先蒐集數據再回頭定；可用 `pg_img_total_kb` 調整，天花板 32MB）。真正的天花板是**後者**：組上游 body 的成本跟總 bytes 成正比、跟張數無關（10 張各 150KB 與 3 張各 500KB 對 CPU 一模一樣），所以張數沒滿也可能先撞到容量。這個數字是量出來的：933KB→1.62ms、1.8MB→3.31ms、2.8MB→6.00ms，而這筆花費發生在**串流開始之前**，花掉的每一毫秒都是從串流迴圈的預算裡扣的。
+  - 單則最多 10 張（`PG_LIMITS.maxImgPerMsg`）；**單次請求所有圖片的原始大小合計上限預設 16MB**（`PG_LIMITS.maxImgBytesTotal`；2026-07-29 從 1.5MB 放寬，先蒐集數據再回頭定；可用 `pg_img_total_kb` 調整，天花板 32MB）。真正的天花板是**後者**：組上游 body 的成本跟總 bytes 成正比、跟張數無關（10 張各 150KB 與 3 張各 500KB 對 CPU 一模一樣），所以張數沒滿也可能先撞到容量。這個數字是量出來的：933KB→1.62ms、1.8MB→3.31ms、2.8MB→6.00ms，而這筆花費發生在**串流開始之前**，花掉的每一毫秒都是從串流迴圈的預算裡扣的。
   - **超量一律回錯誤，絕不靜默截斷**（2026-07-29 改）：正在送的那一則若張數或容量超標，回 400 並講明「最多幾張／你選了幾張」。舊行為是默默只送前幾張，會員完全不知道自己少送了圖。**只有歷史訊息**仍然靜默降級成 `[已省略的圖片：檔名]` —— 那些是既成事實，為了很久以前的一張圖讓整串對話再也接不下去才是本末倒置。
   - 超出預算、或模型看不了圖（歷史訊息）、或內容已被清除 → 那幾張**降級成文字佔位**「[已省略的圖片：檔名]」而不是報錯。原則是**不要因為附件的問題讓人連話都說不出來**：從最舊的開始降級，最新那張（通常就是他正在問的）保到最後。
   - 別人的檔案編號塞進來一律查不到（`WHERE user_id=自己`），靜默降級成佔位，不會洩漏任何內容。

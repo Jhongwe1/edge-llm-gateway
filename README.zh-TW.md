@@ -114,23 +114,36 @@ v2.5 照這個結論做了直通（把上游位元組原樣交給瀏覽器，626
 ```mermaid
 flowchart LR
   V((訪客)) --> W
-  subgraph edge["Cloudflare 邊緣（免費層、一顆 Worker）"]
-    W["Worker · src/index.ts<br/>手寫路由、SSR 外殼、每請求 CSP nonce"]
-    A[("靜態資產 public/<br/>sha256 CSP")]
-    D[("D1（SQLite）<br/>會員·session·內容·<br/>req_log·errlog·audit·usage_daily")]
-    DO["RateLimiter DO<br/>原子檢查並計數<br/>u:會員 · demo-ip:IP · demo:global"]
-    CRON["cron ×2<br/>*/5 告警掃描<br/>每日聚合＋備份＋清理"]
-    R2[("R2（可選）<br/>附件 · 每日 JSONL<br/>備份保留 14 份")]
+  subgraph edge["Cloudflare 邊緣 · 免費層 · 只有一顆 Worker（src/index.ts）"]
+    W["fetch() — 手寫路由<br/>SSR 外殼 · 每請求 CSP nonce<br/><b>每次呼叫 10ms CPU</b>"]
+    CRON["scheduled() — 兩條 cron<br/>*/5 掃 errlog<br/>每日聚合 · 備份 · 清理 · R2 體檢"]
+    A[("靜態資產 public/<br/>sha256 CSP · SPA fallback")]
+    D[("D1 · 一顆 SQLite<br/>會員 · session · 內容 · pg_*<br/>visits · req_log · errlog · audit · usage_daily")]
+    DO["RateLimiter DO — 原子檢查並計數<br/>u:會員 · demo-ip:IP · demo:global<br/>csp-ip:IP · visit:global"]
+    PG["PgStream DO — <b>30 秒 CPU</b><br/>SSE 轉譯 · 上游淨化<br/>落地 · 斷線後續跑<br/>pg:u:會員"]
+    R2[("R2 · 可選<br/>附件 · 每日 JSONL<br/>備份保留 14 份")]
     W --- A
     W --- D
     W --- DO
-    CRON --> W
-    W --> R2
+    W --- R2
+    W ==>|"交棒：job JSON＋原始本體<br/>Response 原樣轉出"| PG
+    PG --- D
+    PG --- R2
+    CRON --- D
+    CRON --> R2
   end
-  W -->|"/relay pump"| U["任何 LLM 上游"]
-  W -->|"/vpn 合併"| AP["機場上游"]
+  PG ==>|"playground 聊天"| U["任何 LLM 上游"]
+  W -->|"/relay · 計量 pump"| U
+  W -->|"/vpn · 多來源合併"| AP["機場上游"]
   CRON -.->|"errlog 增量"| TG["Telegram 告警"]
 ```
+
+怎麼讀：**粗線就是 v2.6 的路徑。** Worker 花約 **3ms** 把一個請求驗完身分、驗完輸入、建好檔，
+剩下的交棒給 `PgStream`，然後把它的 Response 原樣轉出去 —— 那 626ms 的轉譯因此跑在
+30 秒預算的地方，而不是 10 毫秒的地方。把 `PG_STREAM` 綁定拿掉（或設 `settings.pg_do='0'`），
+同一份程式就回到 Worker 裡跑：兩個宿主呼叫的都是同一支 `lib/pgchat.ts`，所以退路是**降級**
+而不是另一種行為。`scheduled()` 畫在同一個 Worker 框裡，因為它**就是**同一顆 Worker ——
+`src/index.ts` 的第二個進入點，不是另一個服務。
 
 ## 設計裁決（ADR，誠實記錄取捨）
 
@@ -152,13 +165,14 @@ flowchart LR
 
 另見：[真實數據報告](./docs/REPORT.md) ·
 [安全稽核：兩輪，以及第一輪的漏檢率](./docs/AUDIT-2026-07.md) ·
+[第三輪稽核 — 那次稽核自己的方法漏掉了什麼](./docs/REVIEW-2026-08.md) ·
 [威脅模型（STRIDE）](./docs/THREAT-MODEL.md) ·
 [與 one-api／LiteLLM／OpenRouter／AI Gateway 的誠實對照](./docs/COMPARISON.md) ·
 [已知債務](./DEBT.md) · [安全政策](./SECURITY.md)
 
-## 工程證據（v2.6.0）
+## 工程證據（v2.6.1）
 
-- **552 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
+- **567 個單元／整合測試跑在 workerd 裡**（`@cloudflare/vitest-pool-workers`）— 跟正式站
   同一顆 runtime：真的 D1、真的 Durable Object、真的串流、真的 `crypto.subtle`。
   上游用 fetchMock 攔截，斷言「上游實際收到什麼」（標頭剝除、金鑰置換、串流位元組保真、
   demo 模式強制 max_tokens）。
@@ -216,9 +230,11 @@ flowchart LR
 - **免費額度是用程式守的**，不是靠人盯儀表板（`src/lib/r2budget.ts`）：管理員能設定的配額
   會被夾在硬天花板內，每日 cron 量真實用量（附件＋備份）再照「實際還剩多少」從最舊的回收，
   每月 Class A／B 操作預算用完則各自降級 —— 寫入退回 D1、讀取走佔位。刪除在 R2 免費，不計數。
-- **存得下 5MB 不等於送得出 5MB。** 單次請求能送給上游的圖片總量仍然卡在
-  `PG_LIMITS.maxImgBytesTotal` 的 1.5MB —— 那是 **CPU** 的限制（ADR-0011）不是儲存的，
-  所以瀏覽器端仍然照「模型吃得下多少」壓縮，而不是照儲存上限。
+- **存得下 5MB 不等於送得出 5MB。** 單次請求能送給上游的圖片總量走的是**另一條預算**
+  （`PG_LIMITS.maxImgBytesTotal`）：組上游 body 的成本跟總 bytes 成正比（933KB→1.62ms、
+  2.8MB→6.00ms），而且花在**串流開始之前**。這筆錢從 Worker 的 10ms 出的時候，它是 **1.5MB**；
+  v2.6 把組裝搬進 Durable Object 之後改成預設 **16MB**（天花板 32MB，可用 `pg_img_total_kb`
+  即時調整）—— 刻意放寬，先用 `req_log.img_bytes` 蒐集真實分佈再回頭定最終值。
 
 完整理由與背後的實測數字：[ADR-0013](./docs/adr/0013-r2-optional-attachments.md)。
 
@@ -230,7 +246,7 @@ cp .dev.vars.example .dev.vars   # 本機開發旗標（wrangler deploy 永遠�
 npm run migrate:local     # 從 migrations/ 建本機 D1
 npm run seed              # 選用：本機種子（管理員＋會員＋示範渠道）
 npm run dev               # http://localhost:8787
-npm run checks            # eslint＋typecheck＋測試
+npm run checks            # eslint＋typecheck＋測試＋文件防漂移
 npm run e2e               # Playwright（自己起 mock 上游＋wrangler dev）
 npm run bench             # 重現 ADR-0011 的 CPU 數字
 npm run loadtest          # 對限流器 DO 打 200 條真併發
@@ -254,10 +270,44 @@ npm run migrate:remote    # 正式庫套新 migration（要在 deploy 之前跑�
 | [API.md](./API.md) | **完整 API 文件**：所有端點、參數、欄位規則、curl 範例（線上 /api-docs 的原稿） |
 | [docs/openapi.yaml](./docs/openapi.yaml) | 機器可讀的 OpenAPI 3.1 規格（線上 `/openapi.json`） |
 | [docs/AUDIT-2026-07.md](./docs/AUDIT-2026-07.md) | 2026-07 安全稽核：兩輪、方法論改動，以及第一輪的漏檢率 |
+| [docs/REVIEW-2026-08.md](./docs/REVIEW-2026-08.md) | 2026-08 第三輪稽核（對 v2.6）：匿名 D1 寫入放大、客戶端消毒器落差、四句被程式推翻的敘述 |
 | [AGENTS.md](./AGENTS.md) | **給 AI agent 的操作指南**：金鑰在哪、照抄流程、驗證清單 |
 | [ADMIN.md](./ADMIN.md) | 管理員維護筆記：部署眉角、資料庫維護、備份與告警（金鑰明文只在 gitignored 的 ADMIN.local.md） |
 | [DEBT.md](./DEBT.md) | 已知債務與門檻（何時該還；還掉劃線留紀錄） |
 | `.claude/skills/uaip-api/` | Claude Code skill 入口（薄殼，指向 AGENTS.md 與 API.md） |
+
+## 如果你是拿這個專案在評估我
+
+功能表可以跳過 —— 功能本身很普通，**真正的作品是決策軌跡**。三件難以造假的事，
+每一件都能在這個 repo 裡幾分鐘之內驗證：
+
+1. **對著平台診斷效能問題，而不是對著程式碼。**
+   免費方案每次呼叫 10ms CPU，超過會直接砍掉 isolate —— **沒有可捕捉的錯誤、沒有日誌、
+   應用層什麼都看不到**。做了兩輪微最佳化把迴圈壓到不能再省，**還是超標 62 倍**，
+   因為真正的成本是「JS 有沒有碰到那些位元組」，跟迴圈怎麼寫無關。
+   解法不是「更快的轉譯」，而是發現 **Durable Object 在同一個免費方案下有 30 秒 CPU**，
+   所以昂貴的那段要的是**搬家、不是刪除**。→ [ADR-0015](./docs/adr/0015-durable-object-streaming.md)
+
+2. **一個已經上線的設計，一天內被自己推翻，而且錯的那版留在 repo 裡。**
+   v2.5 照著量測結果做了最直覺的推論（直通），上線隔天撤掉：直通是靠**刪掉轉譯層**換效能，
+   而那一層正是上游淨化、伺服器落地、token 記帳、斷線續跑的唯一來源。
+   **量測是對的，從量測推出的結論是錯的。**
+   → [ADR-0014](./docs/adr/0014-native-passthrough-streaming.md)（標為已被取代，內容原封保留）
+
+3. **能被檢查的主張全部接上 CI，包括抓到我自己說謊的那幾條。**
+   測試數（直接讀 vitest 的執行結果，不靜態數 `it(` —— 第一版就是那樣寫而漏算了迴圈產生的測試）、
+   E2E 數、三個檔案的版本號、CSP hash、OpenAPI 與路由表雙向核對，以及 2026-08 新增的
+   **「散文裡引述的常數值必須等於程式裡的常數」**。安全工作也是同一套寫法：
+   [兩輪稽核並公布第一輪漏檢率](./docs/AUDIT-2026-07.md)、
+   [第三輪](./docs/REVIEW-2026-08.md)的頭號發現是**第二輪自己的方法本該抓到的**。
+
+**十分鐘的話，照這個順序看**：ADR-0015 → `src/lib/pgchat.ts` → `docs/REVIEW-2026-08.md`
+→ `src/lib/sanitize.ts` → `DEBT.md`。
+
+**關於規模，話講在前面**：一個人維護、一個個人站、使用者個位數。
+[docs/REPORT.md](./docs/REPORT.md) 裡的流量數字很小而且明確標示了；本機合成壓測另外開一節，
+不跟正式數據混在一起。這裡能提供的不是規模，而是**每一項宣稱都查得到**，
+以及那些沒辦法自動檢查的部分，經過了三輪各自公布漏檢率的稽核。
 
 ## 授權
 

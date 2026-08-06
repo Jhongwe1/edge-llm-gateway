@@ -23,7 +23,10 @@ import type { Env } from "../types.js";
 export interface RateCheckArg {
   // svc 只影響「日配額」的鍵名（分鐘窗刻意跨服務共用，對齊 v1 的 60 秒窗）。
   // csp＝/api/csp-report 的匿名回報限流（2026-07-22）：獨立命名空間，不與會員額度互吃。
-  svc: "relay" | "pg" | "csp";
+  // visit＝訪客紀錄的每日寫入上限（2026-08，DEBT #35）：全站一顆實例（visit:global），
+  //   呼叫端做 1/N 抽樣後才問，所以這裡的 perDay 是「抽樣次數」不是「瀏覽次數」——
+  //   換算在 routes/_middleware.ts 的 VISIT_GUARD，別在這裡找。
+  svc: "relay" | "pg" | "csp" | "visit";
   perMin: number; // 每分鐘上限（呼叫端已套個人覆寫；0＝直接擋）
   perDay: number; // 當日上限（同上）
   now?: number; // 測試注入用的時鐘（epoch ms）；正式呼叫不帶＝Date.now()
